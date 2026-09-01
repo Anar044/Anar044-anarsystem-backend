@@ -33,7 +33,16 @@ const io = new Server(httpServer, {
         methods: ["GET", "POST"]
     },
 
-    transports: ["polling", "websocket"]
+    // HorecaControlPlugin uses polling with AutoUpgrade=false.
+    // Keep the transport strictly on polling.
+    transports: ["polling", "websocket"],
+
+    // Give the polling connection a longer heartbeat window.
+    pingInterval: 25000,
+    pingTimeout: 20000,
+
+    // Do not aggressively close idle polling connections.
+    connectTimeout: 120000
 });
 
 // Namespace for HorecaControl plugins
@@ -902,6 +911,9 @@ pluginIO.on(
                 plugin.lastEventAt =
                     now();
 
+                // Последний пакет от плагина хранится только в RAM.
+                // База данных для данных iiko НЕ используется.
+                plugin.lastEvent = event;
 
                 if (
                     event &&
@@ -1291,6 +1303,33 @@ pluginIO.on(
 
     }
 );
+
+// ============================================================
+// CURRENT PLUGIN DATA — RAM ONLY
+// ============================================================
+
+app.get("/api/plugin/data", (req, res) => {
+
+    const plugins = Array.from(connectedPlugins.values());
+
+    const result = plugins.map(plugin => ({
+        pluginId: plugin.pluginId,
+        pluginName: plugin.pluginName,
+        departmentId: plugin.departmentId,
+        departmentName: plugin.departmentName,
+        groupId: plugin.groupId,
+        groupName: plugin.groupName,
+        version: plugin.version,
+        lastEventAt: plugin.lastEventAt,
+        data: plugin.lastEvent || null
+    }));
+
+    res.json({
+        success: true,
+        count: result.length,
+        plugins: result
+    });
+});
 
 // ============================================================
 // START SERVER
