@@ -1,0 +1,32 @@
+nano ~/anarsystem/backend/server.jsconst express = require("express");
+// ==========================================
+// TEST IIKO ENDPOINT
+// ==========================================
+
+app.post("/api/iiko/connect", async (req, res) => {
+
+    res.json({
+        success: true,
+        message: "AnarSystem API работает",
+        received: {
+            ip: req.body.ip || null,
+            port: req.body.port || null,
+            login: req.body.login || null
+        }
+    });
+
+});
+
+// ==========================================
+// START SERVER
+// ==========================================
+
+app.listen(PORT, "127.0.0.1", () => {
+
+    console.log("=================================");
+    console.log("ANARSYSTEM API");
+    console.log("=================================");
+    console.log(`Node.js: ${process.version}`);
+    console.log(`Port: ${PORT}`);
+    console.log("Server started");
+});

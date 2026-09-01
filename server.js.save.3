@@ -1,0 +1,1294 @@
+const express = require("express");
+const cors = require("cors");
+const http = require("http");
+const crypto = require("crypto");
+const { Server } = require("socket.io");
+
+const app = express();
+const httpServer = http.createServer(app);
+
+const PORT = 3000;
+
+// ============================================================
+// EXPRESS
+// ============================================================
+
+app.use(cors());
+
+app.use(
+    express.json({
+        limit: "20mb"
+    })
+);
+
+// ============================================================
+// SOCKET.IO
+// ============================================================
+
+const io = new Server(httpServer, {
+    path: "/plugin-websocket/socket.io",
+
+    cors: {
+        origin: "*",
+        methods: ["GET", "POST"]
+    },
+
+    transports: ["polling", "websocket"]
+});
+
+// Наш namespace для плагинов
+const pluginIO = io.of("/plugin-websocket");
+
+// ============================================================
+// CONNECTED PLUGINS
+// ============================================================
+
+// socketId -> plugin
+const plugins = new Map();
+
+// requestId -> pending request
+const pendingRequests = new Map();
+
+// ============================================================
+// SETTINGS
+// ============================================================
+
+const REQUEST_TIMEOUT_MS = 30000;
+
+// ============================================================
+// HELPERS
+// ============================================================
+
+function now() {
+    return new Date().toISOString();
+}
+
+function generateRequestId() {
+    return crypto.randomUUID();
+}
+
+function logJson(title, data) {
+    console.log("");
+    console.log(title);
+
+    try {
+        console.log(
+            JSON.stringify(
+                data,
+                null,
+                2
+            )
+        );
+    } catch (error) {
+        console.log(
+            String(data)
+        );
+    }
+}
+
+// ============================================================
+// FIND PLUGIN
+// ============================================================
+
+function findPlugin(requestBody) {
+
+    const requestedSocketId =
+        requestBody.socketId || null;
+
+    const requestedPluginId =
+        requestBody.pluginId || null;
+
+    const requestedDepartmentId =
+        requestBody.departmentId || null;
+
+    const requestedGroupId =
+        requestBody.groupId || null;
+
+
+    // --------------------------------------------------------
+    // 1. По socketId
+    // --------------------------------------------------------
+
+    if (requestedSocketId) {
+
+        const plugin =
+            plugins.get(requestedSocketId);
+
+        if (plugin) {
+            return plugin;
+        }
+
+        return null;
+    }
+
+
+    // --------------------------------------------------------
+    // 2. По pluginId
+    // --------------------------------------------------------
+
+    if (requestedPluginId) {
+
+        for (const plugin of plugins.values()) {
+
+            if (
+                String(plugin.pluginId) ===
+                String(requestedPluginId)
+            ) {
+                return plugin;
+            }
+        }
+    }
+
+
+    // --------------------------------------------------------
+    // 3. По departmentId
+    // --------------------------------------------------------
+
+    if (requestedDepartmentId) {
+
+        for (const plugin of plugins.values()) {
+
+            if (
+                String(plugin.departmentId) ===
+                String(requestedDepartmentId)
+            ) {
+                return plugin;
+            }
+        }
+    }
+
+
+    // --------------------------------------------------------
+    // 4. По groupId
+    // --------------------------------------------------------
+
+    if (requestedGroupId) {
+
+        for (const plugin of plugins.values()) {
+
+            if (
+                String(plugin.groupId) ===
+                String(requestedGroupId)
+            ) {
+                return plugin;
+            }
+        }
+    }
+
+
+    // --------------------------------------------------------
+    // 5. Если подключен только один плагин
+    // --------------------------------------------------------
+
+    if (plugins.size === 1) {
+
+        return (
+            plugins.values().next().value
+        );
+    }
+
+
+    return null;
+}
+
+// ============================================================
+// HEALTH
+// ============================================================
+
+app.get(
+    "/api/health",
+    (req, res) => {
+
+        res.json({
+
+            success: true,
+
+            service:
+                "AnarSystem API",
+
+            server:
+                "Oracle VPS",
+
+            node:
+                process.version,
+
+            time:
+                now(),
+
+            socketIo:
+                true,
+
+            socketIoPath:
+                "/plugin-websocket/socket.io",
+
+            socketIoNamespace:
+                "/plugin-websocket",
+
+            connectedPlugins:
+                plugins.size,
+
+            pendingRequests:
+                pendingRequests.size
+        });
+
+    }
+);
+
+// ============================================================
+// IIKO CONNECT TEST
+// ============================================================
+
+app.post(
+    "/api/iiko/connect",
+    async (req, res) => {
+
+        res.json({
+
+            success: true,
+
+            message:
+                "AnarSystem API работает",
+
+            received: {
+
+                ip:
+                    req.body.ip || null,
+
+                port:
+                    req.body.port || null,
+
+                login:
+                    req.body.login || null
+            }
+
+        });
+
+    }
+);
+
+// ============================================================
+// PLUGIN STATUS
+// ============================================================
+
+app.get(
+    "/api/plugin/status",
+    (req, res) => {
+
+        const result = [];
+
+        for (
+            const [socketId, plugin]
+            of plugins.entries()
+        ) {
+
+            result.push({
+
+                socketId,
+
+                pluginId:
+                    plugin.pluginId,
+
+                pluginName:
+                    plugin.pluginName,
+
+                departmentId:
+                    plugin.departmentId,
+
+                departmentName:
+                    plugin.departmentName,
+
+                groupId:
+                    plugin.groupId,
+
+                groupName:
+                    plugin.groupName,
+
+                version:
+                    plugin.version,
+
+                currencyCode:
+                    plugin.currencyCode,
+
+                serverUrl:
+                    plugin.serverUrl,
+
+                connectedAt:
+                    plugin.connectedAt,
+
+                lastEventAt:
+                    plugin.lastEventAt,
+
+                lastResponseAt:
+                    plugin.lastResponseAt
+            });
+
+        }
+
+        res.json({
+
+            success: true,
+
+            count:
+                result.length,
+
+            plugins:
+                result
+        });
+
+    }
+);
+
+// ============================================================
+// PLUGIN REQUEST
+// ============================================================
+//
+// Сайт вызывает:
+//
+// POST /api/plugin/request
+//
+// {
+//   "action": "get_sales",
+//   "pluginId": "...",
+//   "params": {
+//      ...
+//   }
+// }
+//
+// ============================================================
+
+app.post(
+    "/api/plugin/request",
+    async (req, res) => {
+
+        const body =
+            req.body || {};
+
+        const action =
+            body.action;
+
+        if (!action) {
+
+            return res.status(400).json({
+
+                success: false,
+
+                error:
+                    "action is required"
+            });
+        }
+
+
+        const plugin =
+            findPlugin(body);
+
+
+        if (!plugin) {
+
+            return res.status(503).json({
+
+                success: false,
+
+                error:
+                    "No connected plugin found",
+
+                connectedPlugins:
+                    plugins.size
+            });
+        }
+
+
+        const requestId =
+            generateRequestId();
+
+
+        const request = {
+
+            requestId,
+
+            action,
+
+            params:
+                body.params || {},
+
+            createdAt:
+                now()
+        };
+
+
+        logJson(
+            "========== SITE -> PLUGIN REQUEST ==========",
+            {
+                socketId:
+                    plugin.socketId,
+
+                pluginId:
+                    plugin.pluginId,
+
+                request
+            }
+        );
+
+
+        return new Promise(
+            (resolve) => {
+
+                const timer =
+                    setTimeout(
+                        () => {
+
+                            pendingRequests.delete(
+                                requestId
+                            );
+
+
+                            console.log("");
+
+                            console.log(
+                                "========== PLUGIN REQUEST TIMEOUT =========="
+                            );
+
+                            console.log(
+                                "Request ID:",
+                                requestId
+                            );
+
+                            console.log(
+                                "Action:",
+                                action
+                            );
+
+
+                            resolve(
+                                res.status(504).json({
+
+                                    success: false,
+
+                                    error:
+                                        "Plugin request timeout",
+
+                                    requestId,
+
+                                    action
+                                })
+                            );
+
+                        },
+                        REQUEST_TIMEOUT_MS
+                    );
+
+
+                pendingRequests.set(
+                    requestId,
+                    {
+                        resolve,
+                        timer,
+                        action,
+                        pluginSocketId:
+                            plugin.socketId,
+                        createdAt:
+                            now()
+                    }
+                );
+
+
+                try {
+
+                    plugin.socket.emit(
+                        "server_to_plugin_request",
+                        request
+                    );
+
+                    console.log("");
+
+                    console.log(
+                        "Request sent to plugin."
+                    );
+
+                    console.log(
+                        "Request ID:",
+                        requestId
+                    );
+
+                    console.log(
+                        "Action:",
+                        action
+                    );
+
+                }
+                catch (error) {
+
+                    clearTimeout(
+                        timer
+                    );
+
+                    pendingRequests.delete(
+                        requestId
+                    );
+
+
+                    console.error(
+                        "Failed to send request to plugin:",
+                        error
+                    );
+
+
+                    resolve(
+                        res.status(500).json({
+
+                            success: false,
+
+                            error:
+                                "Failed to send request to plugin",
+
+                            requestId
+                        })
+                    );
+
+                }
+
+            }
+        );
+    }
+);
+
+// ============================================================
+// SOCKET.IO CONNECTION
+// ============================================================
+
+pluginIO.on(
+    "connection",
+    (socket) => {
+
+        console.log("");
+
+        console.log(
+            "=========================================="
+        );
+
+        console.log(
+            "=== SOCKET.IO CONNECTION ==="
+        );
+
+        console.log(
+            "=========================================="
+        );
+
+
+        console.log(
+            "ID:",
+            socket.id
+        );
+
+
+        console.log(
+            "NAMESPACE:",
+            socket.nsp.name
+        );
+
+
+        console.log(
+            "AUTH:",
+            JSON.stringify(
+                socket.handshake.auth,
+                null,
+                2
+            )
+        );
+
+
+        console.log(
+            "QUERY:",
+            JSON.stringify(
+                socket.handshake.query,
+                null,
+                2
+            )
+        );
+
+
+        console.log(
+            "=========================================="
+        );
+
+
+        // ======================================================
+        // CREATE PLUGIN
+        // ======================================================
+
+        const query =
+            socket.handshake.query || {};
+
+        const auth =
+            socket.handshake.auth || {};
+
+
+        const plugin = {
+
+            socketId:
+                socket.id,
+
+            pluginId:
+                query.pluginId ||
+                auth.pluginId ||
+                null,
+
+            pluginName:
+                query.pluginName ||
+                auth.pluginName ||
+                null,
+
+            departmentId:
+                query.departmentId ||
+                auth.departmentId ||
+                null,
+
+            departmentName:
+                query.departmentName ||
+                auth.departmentName ||
+                null,
+
+            groupId:
+                query.groupId ||
+                auth.groupId ||
+                null,
+
+            groupName:
+                query.groupName ||
+                auth.groupName ||
+                null,
+
+            version:
+                query.version ||
+                auth.version ||
+                null,
+
+            currencyCode:
+                query.currencyCode ||
+                auth.currencyCode ||
+                null,
+
+            serverUrl:
+                auth.serverUrl ||
+                null,
+
+            connectedAt:
+                now(),
+
+            lastEventAt:
+                null,
+
+            lastResponseAt:
+                null
+        };
+
+
+        plugins.set(
+            socket.id,
+            plugin
+        );
+
+
+        console.log("");
+
+        console.log(
+            "================================="
+        );
+
+        console.log(
+            "PLUGIN CONNECTED"
+        );
+
+        console.log(
+            "================================="
+        );
+
+        console.log(
+            "Socket:",
+            socket.id
+        );
+
+        console.log(
+            "Plugin ID:",
+            plugin.pluginId
+        );
+
+        console.log(
+            "Plugin Name:",
+            plugin.pluginName
+        );
+
+        console.log(
+            "Department:",
+            plugin.departmentId,
+            plugin.departmentName
+        );
+
+        console.log(
+            "Group:",
+            plugin.groupId,
+            plugin.groupName
+        );
+
+        console.log(
+            "Version:",
+            plugin.version
+        );
+
+        console.log(
+            "Server URL:",
+            plugin.serverUrl
+        );
+
+        console.log(
+            "Time:",
+            now()
+        );
+
+        console.log(
+            "================================="
+        );
+
+
+        // ======================================================
+        // PLUGIN -> SERVER
+        // IDENTITY / GENERAL MESSAGE
+        // ======================================================
+
+        socket.on(
+            "plugin_to_server",
+            (message) => {
+
+                console.log("");
+
+                console.log(
+                    "========== plugin_to_server =========="
+                );
+
+
+                logJson(
+                    "MESSAGE:",
+                    message
+                );
+
+
+                plugin.lastEventAt =
+                    now();
+
+
+                if (
+                    message &&
+                    typeof message === "object"
+                ) {
+
+                    plugin.pluginId =
+                        message.pluginId ||
+                        plugin.pluginId;
+
+                    plugin.pluginName =
+                        message.pluginName ||
+                        plugin.pluginName;
+
+                    plugin.departmentId =
+                        message.departmentId ||
+                        plugin.departmentId;
+
+                    plugin.departmentName =
+                        message.departmentName ||
+                        plugin.departmentName;
+
+                    plugin.groupId =
+                        message.groupId ||
+                        plugin.groupId;
+
+                    plugin.groupName =
+                        message.groupName ||
+                        plugin.groupName;
+
+                    plugin.version =
+                        message.version ||
+                        plugin.version;
+
+                    plugin.currencyCode =
+                        message.currencyCode ||
+                        plugin.currencyCode;
+
+                    plugin.serverUrl =
+                        message.serverUrl ||
+                        plugin.serverUrl;
+                }
+
+            }
+        );
+
+
+        // ======================================================
+        // PLUGIN EVENT
+        // ======================================================
+
+        socket.on(
+            "plugin_to_server_event",
+            (event) => {
+
+                console.log("");
+
+                console.log(
+                    "========== plugin_to_server_event =========="
+                );
+
+
+                logJson(
+                    "EVENT:",
+                    event
+                );
+
+
+                plugin.lastEventAt =
+                    now();
+
+
+                if (
+                    event &&
+                    typeof event === "object"
+                ) {
+
+                    console.log(
+                        "Plugin event type:",
+                        event.pluginEventType ||
+                        "unknown"
+                    );
+
+                    console.log(
+                        "Plugin UUID:",
+                        event.uuid ||
+                        "unknown"
+                    );
+
+                }
+
+            }
+        );
+
+
+        // ======================================================
+        // FULL DATA
+        // ======================================================
+
+        socket.on(
+            "plugin_to_server_full",
+            (data, callback) => {
+
+                console.log("");
+
+                console.log(
+                    "========== plugin_to_server_full =========="
+                );
+
+
+                logJson(
+                    "DATA:",
+                    data
+                );
+
+
+                plugin.lastEventAt =
+                    now();
+
+
+                if (
+                    typeof callback ===
+                    "function"
+                ) {
+
+                    callback({
+
+                        success:
+                            true,
+
+                        receivedAt:
+                            now()
+                    });
+
+                }
+
+            }
+        );
+
+
+        // ======================================================
+        // PLUGIN RESPONSE
+        // ======================================================
+        //
+        // Плагин должен ответить:
+        //
+        // {
+        //   requestId: "...",
+        //   success: true,
+        //   data: [...]
+        // }
+        //
+        // ======================================================
+
+        socket.on(
+            "plugin_to_server_response",
+            (response) => {
+
+                console.log("");
+
+                console.log(
+                    "========== PLUGIN RESPONSE =========="
+                );
+
+
+                logJson(
+                    "RESPONSE:",
+                    response
+                );
+
+
+                plugin.lastResponseAt =
+                    now();
+
+                plugin.lastEventAt =
+                    now();
+
+
+                if (
+                    !response ||
+                    typeof response !== "object"
+                ) {
+
+                    console.log(
+                        "Invalid plugin response."
+                    );
+
+                    return;
+                }
+
+
+                const requestId =
+                    response.requestId;
+
+
+                if (!requestId) {
+
+                    console.log(
+                        "Plugin response has no requestId."
+                    );
+
+                    return;
+                }
+
+
+                const pending =
+                    pendingRequests.get(
+                        requestId
+                    );
+
+
+                if (!pending) {
+
+                    console.log(
+                        "No pending request for:",
+                        requestId
+                    );
+
+                    return;
+                }
+
+
+                clearTimeout(
+                    pending.timer
+                );
+
+
+                pendingRequests.delete(
+                    requestId
+                );
+
+
+                console.log("");
+
+                console.log(
+                    "Request completed:"
+                );
+
+                console.log(
+                    "Request ID:",
+                    requestId
+                );
+
+                console.log(
+                    "Action:",
+                    pending.action
+                );
+
+
+                pending.resolve(
+                    res.json({
+
+                        success:
+                            response.success !== false,
+
+                        requestId,
+
+                        action:
+                            pending.action,
+
+                        data:
+                            response.data !== undefined
+                                ? response.data
+                                : null,
+
+                        error:
+                            response.error ||
+                            null
+                    })
+                );
+
+            }
+        );
+
+
+        // ======================================================
+        // PING / TEST
+        // ======================================================
+
+        socket.on(
+            "plugin_ping",
+            (data, callback) => {
+
+                console.log(
+                    "Plugin ping:",
+                    data
+                );
+
+
+                if (
+                    typeof callback ===
+                    "function"
+                ) {
+
+                    callback({
+
+                        success:
+                            true,
+
+                        serverTime:
+                            now(),
+
+                        received:
+                            data || null
+                    });
+
+                }
+
+            }
+        );
+
+
+        // ======================================================
+        // DISCONNECT
+        // ======================================================
+
+        socket.on(
+            "disconnect",
+            (reason) => {
+
+                console.log("");
+
+                console.log(
+                    "================================="
+                );
+
+                console.log(
+                    "PLUGIN DISCONNECTED"
+                );
+
+                console.log(
+                    "================================="
+                );
+
+                console.log(
+                    "Socket:",
+                    socket.id
+                );
+
+                console.log(
+                    "Plugin ID:",
+                    plugin.pluginId
+                );
+
+                console.log(
+                    "Reason:",
+                    reason
+                );
+
+                console.log(
+                    "Time:",
+                    now()
+                );
+
+
+                // ------------------------------------------------
+                // Завершаем запросы этого плагина
+                // ------------------------------------------------
+
+                for (
+                    const [
+                        requestId,
+                        pending
+                    ]
+                    of pendingRequests.entries()
+                ) {
+
+                    if (
+                        pending.pluginSocketId ===
+                        socket.id
+                    ) {
+
+                        clearTimeout(
+                            pending.timer
+                        );
+
+                        pendingRequests.delete(
+                            requestId
+                        );
+
+
+                        pending.resolve(
+                            res.status(503).json({
+
+                                success:
+                                    false,
+
+                                error:
+                                    "Plugin disconnected",
+
+                                requestId,
+
+                                action:
+                                    pending.action
+                            })
+                        );
+
+                    }
+
+                }
+
+
+                plugins.delete(
+                    socket.id
+                );
+
+            }
+        );
+
+
+        // ======================================================
+        // DEBUG ALL EVENTS
+        // ======================================================
+
+        socket.onAny(
+            (eventName, ...args) => {
+
+                console.log("");
+
+                console.log(
+                    "========== SOCKET EVENT =========="
+                );
+
+                console.log(
+                    "Event:",
+                    eventName
+                );
+
+
+                if (
+                    eventName !==
+                        "plugin_to_server" &&
+
+                    eventName !==
+                        "plugin_to_server_event" &&
+
+                    eventName !==
+                        "plugin_to_server_full" &&
+
+                    eventName !==
+                        "plugin_to_server_response"
+                ) {
+
+                    logJson(
+                        "Arguments:",
+                        args
+                    );
+
+                }
+
+            }
+        );
+
+    }
+);
+
+// ============================================================
+// START
+// ============================================================
+
+httpServer.listen(
+    PORT,
+    "127.0.0.1",
+    () => {
+
+        console.log("");
+
+        console.log(
+            "================================="
+        );
+
+        console.log(
+            "ANARSYSTEM API"
+        );
+
+        console.log(
+            "================================="
+        );
+
+        console.log(
+            "Node.js:",
+            process.version
+        );
+
+        console.log(
+            "Port:",
+            PORT
+        );
+
+        console.log(
+            "HTTP: 127.0.0.1:" +
+            PORT
+        );
+
+        console.log(
+            "Socket.IO path:",
+            "/plugin-websocket/socket.io"
+        );
+
+        console.log(
+            "Socket.IO namespace:",
+            "/plugin-websocket"
+        );
+
+        console.log(
+            "Request API:",
+            "/api/plugin/request"
+        );
+
+        console.log(
+            "Server started"
+        );
+
+        console.log(
+            "================================="
+        );
+
+    }

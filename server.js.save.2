@@ -1,0 +1,465 @@
+const express = require("express");
+const cors = require("cors");
+const http = require("http");
+const { Server } = require("socket.io");
+
+const app = express();
+const httpServer = http.createServer(app);
+
+const PORT = 3000;
+
+// ============================================================
+// EXPRESS
+// ============================================================
+
+app.use(cors());
+
+app.use(
+    express.json({
+        limit: "20mb"
+    })
+);
+
+// ============================================================
+// SOCKET.IO
+// ============================================================
+
+const io = new Server(httpServer, {
+    path: "/plugin-websocket/socket.io",
+
+    cors: {
+        origin: "*",
+        methods: ["GET", "POST"]
+    }
+});
+
+// ============================================================
+// PLUGIN NAMESPACE
+// ============================================================
+
+const pluginIO = io.of("/plugin-websocket");
+
+// ============================================================
+// CONNECTED PLUGINS
+// ============================================================
+
+const plugins = new Map();
+
+// ============================================================
+// HELPERS
+// ============================================================
+
+function now() {
+    return new Date().toISOString();
+}
+
+function safeString(value) {
+    if (value === undefined || value === null) {
+        return "";
+    }
+
+    return String(value).trim();
+}
+
+// ============================================================
+// HEALTH
+// ============================================================
+
+app.get("/api/health", (req, res) => {
+
+    res.json({
+        success: true,
+        service: "AnarSystem API",
+        server: "Oracle VPS",
+        node: process.version,
+        time: now(),
+        socketIo: true,
+        connectedPlugins: plugins.size
+    });
+
+});
+
+// ============================================================
+// CONNECT TEST
+// ============================================================
+
+app.post("/api/iiko/connect", async (req, res) => {
+
+    res.json({
+        success: true,
+        message: "AnarSystem API работает",
+        received: {
+            ip: req.body.ip || null,
+            port: req.body.port || null,
+            login: req.body.login || null
+        }
+    });
+
+});
+
+// ============================================================
+// PLUGIN STATUS
+// ============================================================
+
+app.get("/api/plugin/status", (req, res) => {
+
+    const result = [];
+
+    for (const [socketId, plugin] of plugins.entries()) {
+
+        result.push({
+            socketId,
+            ...plugin
+        });
+
+    }
+
+    res.json({
+        success: true,
+        count: result.length,
+        plugins: result
+    });
+
+});
+
+// ============================================================
+// SOCKET.IO CONNECTION
+// ============================================================
+
+pluginIO.on("connection", (socket) => {
+
+    // ========================================================
+    // HANDSHAKE DEBUG
+    // ========================================================
+
+    console.log("");
+    console.log("==========================================");
+    console.log("=== SOCKET.IO CONNECTION ===");
+    console.log("==========================================");
+
+    console.log("ID:", socket.id);
+
+    console.log(
+        "NAMESPACE:",
+        socket.nsp.name
+    );
+
+    console.log(
+        "AUTH:",
+        JSON.stringify(
+            socket.handshake.auth,
+            null,
+            2
+        )
+    );
+
+    console.log(
+        "QUERY:",
+        JSON.stringify(
+            socket.handshake.query,
+            null,
+            2
+        )
+    );
+
+    console.log("==========================================");
+
+    // ========================================================
+    // PLUGIN CONNECTED
+    // ========================================================
+
+    console.log("");
+    console.log("=================================");
+    console.log("PLUGIN CONNECTED");
+    console.log("=================================");
+    console.log("Socket:", socket.id);
+    console.log("Time:", now());
+
+    // ========================================================
+    // PLUGIN OBJECT
+    // ========================================================
+
+    const plugin = {
+
+        socketId: socket.id,
+
+        pluginId: null,
+        pluginName: null,
+
+        departmentId: null,
+        departmentName: null,
+
+        groupId: null,
+        groupName: null,
+
+        version: null,
+        currencyCode: null,
+
+        serverUrl: null,
+
+        connectedAt: now(),
+        lastEventAt: null
+    };
+
+    plugins.set(
+        socket.id,
+        plugin
+    );
+
+    // ========================================================
+    // CONNECTION DATA
+    // ========================================================
+
+    socket.on(
+        "plugin_to_server",
+        (message) => {
+
+            console.log("");
+            console.log(
+                "========== plugin_to_server =========="
+            );
+
+            console.log(
+                JSON.stringify(
+                    message,
+                    null,
+                    2
+                )
+            );
+
+            plugin.lastEventAt = now();
+
+            // ------------------------------------------------
+            // IDENTITY
+            // ------------------------------------------------
+
+            if (
+                message &&
+                typeof message === "object"
+            ) {
+
+                plugin.pluginId =
+                    message.pluginId ||
+                    plugin.pluginId;
+
+                plugin.pluginName =
+                    message.pluginName ||
+                    plugin.pluginName;
+
+                plugin.departmentId =
+                    message.departmentId ||
+                    plugin.departmentId;
+
+                plugin.departmentName =
+                    message.departmentName ||
+                    plugin.departmentName;
+
+                plugin.groupId =
+                    message.groupId ||
+                    plugin.groupId;
+
+                plugin.groupName =
+                    message.groupName ||
+                    plugin.groupName;
+
+                plugin.version =
+                    message.version ||
+                    plugin.version;
+
+                plugin.currencyCode =
+                    message.currencyCode ||
+                    plugin.currencyCode;
+
+                plugin.serverUrl =
+                    message.serverUrl ||
+                    plugin.serverUrl;
+            }
+
+        }
+    );
+
+    // ========================================================
+    // PLUGIN EVENT
+    // ========================================================
+
+    socket.on(
+        "plugin_to_server_event",
+        (event) => {
+
+            console.log("");
+            console.log(
+                "========== plugin_to_server_event =========="
+            );
+
+            console.log(
+                JSON.stringify(
+                    event,
+                    null,
+                    2
+                )
+            );
+
+            plugin.lastEventAt = now();
+
+            if (
+                event &&
+                typeof event === "object"
+            ) {
+
+                console.log(
+                    "Plugin event type:",
+                    event.pluginEventType ||
+                    "unknown"
+                );
+
+                console.log(
+                    "Plugin UUID:",
+                    event.uuid ||
+                    "unknown"
+                );
+            }
+
+        }
+    );
+
+    // ========================================================
+    // FULL DATA
+    // ========================================================
+
+    socket.on(
+        "plugin_to_server_full",
+        (data, callback) => {
+
+            console.log("");
+            console.log(
+                "========== plugin_to_server_full =========="
+            );
+
+            console.log(
+                JSON.stringify(
+                    data,
+                    null,
+                    2
+                )
+            );
+
+            plugin.lastEventAt = now();
+
+            // ------------------------------------------------
+            // ACK
+            // ------------------------------------------------
+
+            if (
+                typeof callback === "function"
+            ) {
+
+                callback({
+                    success: true,
+                    receivedAt: now()
+                });
+
+            }
+
+        }
+    );
+
+    // ========================================================
+    // DISCONNECT
+    // ========================================================
+
+    socket.on(
+        "disconnect",
+        (reason) => {
+
+            console.log("");
+            console.log("=================================");
+            console.log("PLUGIN DISCONNECTED");
+            console.log("=================================");
+            console.log("Socket:", socket.id);
+            console.log("Reason:", reason);
+            console.log("Time:", now());
+
+            plugins.delete(
+                socket.id
+            );
+
+        }
+    );
+
+    // ========================================================
+    // DEBUG SOCKET EVENTS
+    // ========================================================
+
+    socket.onAny(
+        (eventName, ...args) => {
+
+            console.log("");
+            console.log(
+                "========== SOCKET EVENT =========="
+            );
+
+            console.log(
+                "Event:",
+                eventName
+            );
+
+            if (
+                eventName !== "plugin_to_server" &&
+                eventName !== "plugin_to_server_event" &&
+                eventName !== "plugin_to_server_full"
+            ) {
+
+                console.log(
+                    JSON.stringify(
+                        args,
+                        null,
+                        2
+                    )
+                );
+
+            }
+
+        }
+    );
+
+});
+
+// ============================================================
+// START
+// ============================================================
+
+httpServer.listen(
+    PORT,
+    "127.0.0.1",
+    () => {
+
+        console.log("");
+        console.log("=================================");
+        console.log("ANARSYSTEM API");
+        console.log("=================================");
+        console.log(
+            "Node.js:",
+            process.version
+        );
+        console.log(
+            "Port:",
+            PORT
+        );
+        console.log(
+            "HTTP: 127.0.0.1:" + PORT
+        );
+        console.log(
+            "Socket.IO path: /plugin-websocket/socket.io"
+        );
+        console.log(
+            "Socket.IO namespace: /plugin-websocket"
+        );
+        console.log(
+            "Server started"
+        );
+        console.log(
+            "================================="
+        );
+
+    }
+kkAAASSACSS
