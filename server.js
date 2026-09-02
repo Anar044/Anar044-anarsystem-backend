@@ -109,6 +109,20 @@ function mergeOrderEvent(plugin, event) {
     });
 }
 
+function restoreOrderDetails(plugin, saved) {
+    if (!saved || typeof saved !== "object") return;
+    for (const list of Object.values(saved)) {
+        if (!Array.isArray(list)) continue;
+        for (const entry of list) {
+            if (!entry || !entry.data) continue;
+            mergeOrderEvent(plugin, {
+                pluginEventType: entry.pluginEventType || null,
+                data: entry.data
+            });
+        }
+    }
+}
+
 function recordHistory(plugin, event) {
     const data = event?.data;
     const number = orderNumber(data);
@@ -388,6 +402,7 @@ pluginIO.on("connection", socket => {
 
     const saved = historyStore[String(plugin.pluginId || "unknown")];
     if (saved) for (const [key, list] of Object.entries(saved)) if (Array.isArray(list)) plugin.orderHistory.set(key, list);
+    restoreOrderDetails(plugin, saved);
 
     plugins.set(socket.id, plugin);
     console.log("PLUGIN CONNECTED", socket.id, plugin.pluginId, plugin.pluginName);
