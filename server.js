@@ -2,6 +2,7 @@ const express = require("express");
 const cors = require("cors");
 const http = require("http");
 const crypto = require("crypto");
+const zlib = require("zlib");
 const { Server } = require("socket.io");
 
 const app = express();
@@ -40,6 +41,46 @@ function normalizeMessage(message) {
     catch (error) { return message; }
 }
 
+// The plugin sends PluginFullData as a gzipped byte array through Socket.IO.
+// Accept binary, base64, JSON text and already-decoded objects.
+function decodePluginFullData(raw) {
+    if (raw && typeof raw === "object" && !Buffer.isBuffer(raw) && !ArrayBuffer.isView(raw) && !Array.isArray(raw)) {
+        return raw;
+    }
+
+    let buffer = null;
+    if (Buffer.isBuffer(raw)) {
+        buffer = raw;
+    } else if (raw instanceof Uint8Array) {
+        buffer = Buffer.from(raw);
+    } else if (Array.isArray(raw) && raw.every(x => Number.isInteger(x) && x >= 0 && x <= 255)) {
+        buffer = Buffer.from(raw);
+    } else if (typeof raw === "string") {
+        try {
+            const parsed = JSON.parse(raw);
+            if (parsed && typeof parsed === "object") return parsed;
+        } catch (_) {}
+        try { buffer = Buffer.from(raw, "base64"); } catch (_) {}
+    }
+
+    if (!buffer || !buffer.length) return null;
+
+    const attempts = [
+        () => zlib.gunzipSync(buffer),
+        () => zlib.unzipSync(buffer),
+        () => buffer
+    ];
+
+    for (const decode of attempts) {
+        try {
+            const text = decode().toString("utf8");
+            try { return JSON.parse(text); } catch (_) {}
+        } catch (_) {}
+    }
+
+    return null;
+}
+
 function findPlugin(body) {
     const requestedSocketId = body.socketId || null;
     const requestedPluginId = body.pluginId || null;
@@ -53,7 +94,6 @@ function findPlugin(body) {
     return null;
 }
 
-// Orders are requested from the full plugin report.
 const requestTypeByAction = {
     get_sales: "summaryOfRestaurant",
     get_orders: "getFullDataReport",
@@ -110,6 +150,16 @@ function enrichOrders(value, orderDetails) {
 
     for (const [key, child] of Object.entries(result)) result[key] = enrichOrders(child, orderDetails);
     return result;
+}
+
+function findPendingOrderRequest(pluginSocketId) {
+    let found = null;
+    for (const pending of pendingRequests.values()) {
+        if (pending.action !== "get_orders") continue;
+        if (pending.pluginSocketId !== pluginSocketId) continue;
+        if (!found || pending.createdAt < found.createdAt) found = pending;
+    }
+    return found;
 }
 
 app.get("/api/health", (req, res) => res.json({
@@ -226,7 +276,6 @@ pluginIO.on("connection", (socket) => {
         if (!pending) return;
 
         let data = message.data !== undefined ? message.data : null;
-        // Enrich the full/current order tree with fields received from live plugin events.
         if (pending.action === "get_orders" && data) data = enrichOrders(data, plugin.orderDetails);
 
         pending.finish(200, {
@@ -245,9 +294,35 @@ pluginIO.on("connection", (socket) => {
         mergeOrderEvent(plugin, event);
     });
 
-    socket.on("plugin_to_server_full", (data, callback) => {
-        logJson("========== plugin_to_server_full ==========", data);
+    // getFullDataReport is returned by the plugin through a separate
+    // plugin_to_server_full event. Its payload has its own requestId,
+    // so correlate it with the waiting website get_orders request by socket.
+    socket.on("plugin_to_server_full", (rawData, callback) => {
+        logJson("========== plugin_to_server_full ==========", {
+            type: Buffer.isBuffer(rawData) ? "Buffer" : typeof rawData,
+            bytes: Buffer.isBuffer(rawData) ? rawData.length : undefined
+        });
         plugin.lastEventAt = now();
+
+        const decoded = decodePluginFullData(rawData);
+        if (!decoded) {
+            console.log("FULL REPORT DECODE FAILED");
+            if (typeof callback === "function") callback({ success: false, error: "Failed to decode full plugin report" });
+            return;
+        }
+
+        const pending = findPendingOrderRequest(socket.id);
+        if (pending) {
+            const data = enrichOrders(decoded.Data ?? decoded.data ?? decoded, plugin.orderDetails);
+            pending.finish(200, {
+                success: true,
+                requestId: pendingRequests.has(pending.requestId) ? pending.requestId : null,
+                action: "get_orders",
+                data,
+                error: null
+            });
+        }
+
         if (typeof callback === "function") callback({ success: true, receivedAt: now() });
     });
 
