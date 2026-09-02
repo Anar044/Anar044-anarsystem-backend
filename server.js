@@ -41,21 +41,14 @@ function normalizeMessage(message) {
     catch (error) { return message; }
 }
 
-// The plugin sends PluginFullData as a gzipped byte array through Socket.IO.
-// Accept binary, base64, JSON text and already-decoded objects.
 function decodePluginFullData(raw) {
-    if (raw && typeof raw === "object" && !Buffer.isBuffer(raw) && !ArrayBuffer.isView(raw) && !Array.isArray(raw)) {
-        return raw;
-    }
+    if (raw && typeof raw === "object" && !Buffer.isBuffer(raw) && !ArrayBuffer.isView(raw) && !Array.isArray(raw)) return raw;
 
     let buffer = null;
-    if (Buffer.isBuffer(raw)) {
-        buffer = raw;
-    } else if (raw instanceof Uint8Array) {
-        buffer = Buffer.from(raw);
-    } else if (Array.isArray(raw) && raw.every(x => Number.isInteger(x) && x >= 0 && x <= 255)) {
-        buffer = Buffer.from(raw);
-    } else if (typeof raw === "string") {
+    if (Buffer.isBuffer(raw)) buffer = raw;
+    else if (raw instanceof Uint8Array) buffer = Buffer.from(raw);
+    else if (Array.isArray(raw) && raw.every(x => Number.isInteger(x) && x >= 0 && x <= 255)) buffer = Buffer.from(raw);
+    else if (typeof raw === "string") {
         try {
             const parsed = JSON.parse(raw);
             if (parsed && typeof parsed === "object") return parsed;
@@ -77,7 +70,6 @@ function decodePluginFullData(raw) {
             try { return JSON.parse(text); } catch (_) {}
         } catch (_) {}
     }
-
     return null;
 }
 
@@ -102,7 +94,6 @@ const requestTypeByAction = {
     get_employees: "revenueByWaiters"
 };
 
-// RAM cache only. No database and no plugin changes.
 function mergeOrderEvent(plugin, event) {
     if (!event || typeof event !== "object") return;
     const data = event.data;
@@ -217,7 +208,7 @@ app.post("/api/plugin/request", async (req, res) => {
             resolve(res.status(statusCode).json(payload));
         };
         const timer = setTimeout(() => finish(504, { success: false, error: "Plugin request timeout", requestId, action }), REQUEST_TIMEOUT_MS);
-        pendingRequests.set(requestId, { finish, timer, action, pluginSocketId: plugin.socketId, createdAt: now() });
+        pendingRequests.set(requestId, { requestId, finish, timer, action, pluginSocketId: plugin.socketId, createdAt: now() });
 
         try {
             plugin.socket.emit("server_to_plugin", request);
@@ -294,9 +285,6 @@ pluginIO.on("connection", (socket) => {
         mergeOrderEvent(plugin, event);
     });
 
-    // getFullDataReport is returned by the plugin through a separate
-    // plugin_to_server_full event. Its payload has its own requestId,
-    // so correlate it with the waiting website get_orders request by socket.
     socket.on("plugin_to_server_full", (rawData, callback) => {
         logJson("========== plugin_to_server_full ==========", {
             type: Buffer.isBuffer(rawData) ? "Buffer" : typeof rawData,
@@ -314,9 +302,10 @@ pluginIO.on("connection", (socket) => {
         const pending = findPendingOrderRequest(socket.id);
         if (pending) {
             const data = enrichOrders(decoded.Data ?? decoded.data ?? decoded, plugin.orderDetails);
+            const responseRequestId = pending.requestId;
             pending.finish(200, {
                 success: true,
-                requestId: pendingRequests.has(pending.requestId) ? pending.requestId : null,
+                requestId: responseRequestId,
                 action: "get_orders",
                 data,
                 error: null
