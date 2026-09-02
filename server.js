@@ -87,6 +87,48 @@ function orderNumber(data) {
     return data.orderNum ?? data.orderNumber ?? data.OrderNum ?? data.Number ?? data.number ?? null;
 }
 
+function valueByNames(data, names) {
+    if (!data || typeof data !== "object") return null;
+    const wanted = names.map(x => String(x).toLowerCase());
+    for (const [key, value] of Object.entries(data)) {
+        if (wanted.includes(key.toLowerCase()) && value !== null && value !== undefined && value !== "") return value;
+    }
+    return null;
+}
+
+function historicalOrderDetails(plugin, number) {
+    const pk = String(plugin.pluginId || "unknown");
+    const list = historyStore[pk]?.[String(number)] || plugin.orderHistory.get(String(number)) || [];
+    if (!Array.isArray(list) || !list.length) return null;
+
+    const result = {};
+    const fields = {
+        tables: ["tables", "orderTables", "table", "tableName"],
+        floor: ["floor", "floorName", "restaurantSection"],
+        waiter: ["waiter", "waiterName", "waiterFullName"],
+        cashier: ["cashier", "cashierName", "cashierFullName"],
+        revenue: ["revenue", "resultSum", "orderSum", "sum", "total"],
+        openTime: ["openTime", "orderOpenDate", "openedAt", "openingTime"],
+        billTime: ["billTime", "orderBillTime", "precheckTime", "precheckAt"],
+        closeTime: ["closeTime", "orderCloseTime", "closedAt", "closingTime"],
+        payments: ["payments", "payment", "paymentType", "paymentTypeName", "paymentMethod", "paymentName"]
+    };
+
+    for (let i = list.length - 1; i >= 0; i--) {
+        const data = list[i]?.data;
+        if (!data || typeof data !== "object") continue;
+        for (const [target, names] of Object.entries(fields)) {
+            if (result[target] == null) {
+                const value = valueByNames(data, names);
+                if (value != null) result[target] = value;
+            }
+        }
+        if (Object.keys(result).length === Object.keys(fields).length) break;
+    }
+
+    return Object.keys(result).length ? result : null;
+}
+
 function mergeOrderEvent(plugin, event) {
     const data = event?.data;
     const number = orderNumber(data);
@@ -96,14 +138,15 @@ function mergeOrderEvent(plugin, event) {
     plugin.orderDetails.set(key, {
         ...old,
         orderNum: number,
-        tables: data.tables ?? old.tables ?? null,
-        floor: data.floor ?? old.floor ?? null,
-        waiter: data.waiter ?? old.waiter ?? null,
-        cashier: data.cashier ?? old.cashier ?? null,
-        revenue: data.revenue ?? old.revenue ?? null,
-        openTime: data.openTime ?? old.openTime ?? null,
-        billTime: data.billTime ?? old.billTime ?? null,
-        closeTime: data.closeTime ?? old.closeTime ?? null,
+        tables: data.tables ?? data.orderTables ?? old.tables ?? null,
+        floor: data.floor ?? data.floorName ?? old.floor ?? null,
+        waiter: data.waiter ?? data.waiterName ?? old.waiter ?? null,
+        cashier: data.cashier ?? data.cashierName ?? old.cashier ?? null,
+        revenue: data.revenue ?? data.resultSum ?? data.orderSum ?? old.revenue ?? null,
+        payments: data.payments ?? data.payment ?? data.paymentType ?? data.paymentTypeName ?? old.payments ?? null,
+        openTime: data.openTime ?? data.orderOpenDate ?? old.openTime ?? null,
+        billTime: data.billTime ?? data.orderBillTime ?? old.billTime ?? null,
+        closeTime: data.closeTime ?? data.orderCloseTime ?? old.closeTime ?? null,
         lastEventType: event.pluginEventType ?? old.lastEventType ?? null,
         lastEventAt: now()
     });
@@ -247,13 +290,15 @@ function enrichOrders(value, details, plugin) {
     const result = { ...value };
     const number = orderNumber(result);
     if (number !== null && number !== undefined && number !== "") {
-        const extra = details.get(String(number));
+        const extra = details.get(String(number)) || historicalOrderDetails(plugin, number);
         if (extra) {
             if (result.waiter == null && result.Waiter == null) result.waiter = extra.waiter;
             if (result.cashier == null && result.Cashier == null) result.cashier = extra.cashier;
             if (result.floor == null && result.Floor == null) result.floor = extra.floor;
             if (result.tables == null && result.Tables == null && result.orderTables == null && result.OrderTables == null) result.tables = extra.tables;
             if (result.revenue == null && result.Revenue == null && result.orderExpectedRevenue == null && result.OrderExpectedRevenue == null) result.revenue = extra.revenue;
+            if (result.payments == null && result.Payments == null) result.payments = extra.payments;
+            if (result.paymentType == null && result.PaymentType == null && typeof extra.payments === "string") result.paymentType = extra.payments;
             if (result.openTime == null && result.OpenTime == null && result.orderOpenDate == null && result.OrderOpenDate == null) result.openTime = extra.openTime;
             if (result.billTime == null && result.BillTime == null && result.orderBillTime == null && result.OrderBillTime == null) result.billTime = extra.billTime;
             if (result.closeTime == null && result.CloseTime == null && result.orderCloseTime == null && result.OrderCloseTime == null) result.closeTime = extra.closeTime;
