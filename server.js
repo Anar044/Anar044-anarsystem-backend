@@ -3,12 +3,16 @@ const cors = require("cors");
 const http = require("http");
 const crypto = require("crypto");
 const zlib = require("zlib");
+const fs = require("fs");
+const path = require("path");
 const { Server } = require("socket.io");
 
 const app = express();
 const httpServer = http.createServer(app);
 const PORT = 3000;
 const REQUEST_TIMEOUT_MS = 30000;
+const HISTORY_FILE = path.join(__dirname, "order-history.json");
+const MAX_EVENTS_PER_ORDER = 1000;
 
 app.use(cors());
 app.use(express.json({ limit: "20mb" }));
@@ -25,9 +29,37 @@ const io = new Server(httpServer, {
 const pluginIO = io.of("/plugin-websocket");
 const plugins = new Map();
 const pendingRequests = new Map();
+let historyWriteTimer = null;
 
 function now() { return new Date().toISOString(); }
 function generateRequestId() { return crypto.randomUUID(); }
+
+function loadHistoryStore() {
+    try {
+        if (!fs.existsSync(HISTORY_FILE)) return {};
+        const parsed = JSON.parse(fs.readFileSync(HISTORY_FILE, "utf8"));
+        return parsed && typeof parsed === "object" ? parsed : {};
+    } catch (error) {
+        console.error("ORDER HISTORY LOAD FAILED", error.message);
+        return {};
+    }
+}
+
+const historyStore = loadHistoryStore();
+
+function scheduleHistorySave() {
+    if (historyWriteTimer) return;
+    historyWriteTimer = setTimeout(() => {
+        historyWriteTimer = null;
+        try {
+            const temp = `${HISTORY_FILE}.tmp`;
+            fs.writeFileSync(temp, JSON.stringify(historyStore), "utf8");
+            fs.renameSync(temp, HISTORY_FILE);
+        } catch (error) {
+            console.error("ORDER HISTORY SAVE FAILED", error.message);
+        }
+    }, 500);
+}
 
 function logJson(title, data) {
     console.log("\n" + title);
@@ -117,6 +149,42 @@ function mergeOrderEvent(plugin, event) {
         lastEventType: event.pluginEventType ?? previous.lastEventType ?? null,
         lastEventAt: now()
     });
+}
+
+function recordOrderHistory(plugin, event) {
+    if (!event || typeof event !== "object") return;
+    const data = event.data;
+    if (!data || typeof data !== "object") return;
+    const number = data.orderNum ?? data.orderNumber ?? data.number;
+    if (number === null || number === undefined || number === "") return;
+
+    const pluginKey = String(plugin.pluginId || "unknown");
+    const orderKey = String(number);
+    if (!historyStore[pluginKey] || typeof historyStore[pluginKey] !== "object") historyStore[pluginKey] = {};
+    if (!Array.isArray(historyStore[pluginKey][orderKey])) historyStore[pluginKey][orderKey] = [];
+
+    const list = historyStore[pluginKey][orderKey];
+    const uuid = event.uuid || null;
+    if (uuid && list.some(item => item.uuid === uuid)) return;
+
+    list.push({
+        uuid,
+        pluginEventType: event.pluginEventType || null,
+        receivedAt: now(),
+        data
+    });
+    if (list.length > MAX_EVENTS_PER_ORDER) list.splice(0, list.length - MAX_EVENTS_PER_ORDER);
+    scheduleHistorySave();
+}
+
+function attachPluginHistory(plugin) {
+    const pluginKey = String(plugin.pluginId || "unknown");
+    const saved = historyStore[pluginKey];
+    plugin.orderHistory = new Map();
+    if (!saved || typeof saved !== "object") return;
+    for (const [orderKey, events] of Object.entries(saved)) {
+        if (Array.isArray(events)) plugin.orderHistory.set(orderKey, events);
+    }
 }
 
 function enrichOrders(value, orderDetails) {
@@ -219,6 +287,32 @@ app.post("/api/plugin/request", async (req, res) => {
     });
 });
 
+app.get("/api/plugin/order-history", (req, res) => {
+    const orderNum = req.query.orderNum;
+    if (orderNum === undefined || orderNum === null || orderNum === "") return res.status(400).json({ success: false, error: "orderNum is required" });
+
+    const plugin = findPlugin({
+        socketId: req.query.socketId,
+        pluginId: req.query.pluginId,
+        departmentId: req.query.departmentId,
+        groupId: req.query.groupId
+    });
+    if (!plugin) return res.status(503).json({ success: false, error: "No connected plugin found", connectedPlugins: plugins.size });
+
+    const pluginKey = String(plugin.pluginId || "unknown");
+    const saved = historyStore[pluginKey]?.[String(orderNum)];
+    const live = plugin.orderHistory?.get(String(orderNum));
+    const history = Array.isArray(live) ? live : Array.isArray(saved) ? saved : [];
+
+    res.json({
+        success: true,
+        pluginId: plugin.pluginId,
+        orderNum: String(orderNum),
+        count: history.length,
+        history
+    });
+});
+
 pluginIO.on("connection", (socket) => {
     const query = socket.handshake.query || {};
     const auth = socket.handshake.auth || {};
@@ -238,8 +332,10 @@ pluginIO.on("connection", (socket) => {
         lastEventAt: null,
         lastResponseAt: null,
         lastEvent: null,
-        orderDetails: new Map()
+        orderDetails: new Map(),
+        orderHistory: new Map()
     };
+    attachPluginHistory(plugin);
     plugins.set(socket.id, plugin);
 
     console.log("PLUGIN CONNECTED", socket.id, plugin.pluginId, plugin.pluginName);
@@ -283,6 +379,13 @@ pluginIO.on("connection", (socket) => {
         plugin.lastEventAt = now();
         plugin.lastEvent = event;
         mergeOrderEvent(plugin, event);
+        recordOrderHistory(plugin, event);
+        const number = event?.data?.orderNum ?? event?.data?.orderNumber ?? event?.data?.number;
+        if (number !== null && number !== undefined && number !== "") {
+            const pluginKey = String(plugin.pluginId || "unknown");
+            const saved = historyStore[pluginKey]?.[String(number)];
+            if (Array.isArray(saved)) plugin.orderHistory.set(String(number), saved);
+        }
     });
 
     socket.on("plugin_to_server_full", (rawData, callback) => {
