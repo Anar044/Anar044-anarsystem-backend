@@ -2,7 +2,6 @@ const express = require("express");
 const cors = require("cors");
 const http = require("http");
 const crypto = require("crypto");
-const zlib = require("zlib");
 const fs = require("fs");
 const path = require("path");
 const { Server } = require("socket.io");
@@ -29,143 +28,94 @@ const io = new Server(httpServer, {
 const pluginIO = io.of("/plugin-websocket");
 const plugins = new Map();
 const pendingRequests = new Map();
-let historyWriteTimer = null;
 
-function now() { return new Date().toISOString(); }
-function generateRequestId() { return crypto.randomUUID(); }
-
-function loadHistoryStore() {
-    try {
-        if (!fs.existsSync(HISTORY_FILE)) return {};
-        const parsed = JSON.parse(fs.readFileSync(HISTORY_FILE, "utf8"));
-        return parsed && typeof parsed === "object" ? parsed : {};
-    } catch (error) {
-        console.error("ORDER HISTORY LOAD FAILED", error.message);
-        return {};
-    }
+let historyStore = {};
+try {
+    if (fs.existsSync(HISTORY_FILE)) historyStore = JSON.parse(fs.readFileSync(HISTORY_FILE, "utf8")) || {};
+} catch (e) {
+    console.error("ORDER HISTORY LOAD FAILED", e.message);
 }
 
-const historyStore = loadHistoryStore();
-
-function scheduleHistorySave() {
-    if (historyWriteTimer) return;
-    historyWriteTimer = setTimeout(() => {
-        historyWriteTimer = null;
+let historyTimer = null;
+function saveHistory() {
+    if (historyTimer) return;
+    historyTimer = setTimeout(() => {
+        historyTimer = null;
         try {
-            const temp = `${HISTORY_FILE}.tmp`;
-            fs.writeFileSync(temp, JSON.stringify(historyStore), "utf8");
-            fs.renameSync(temp, HISTORY_FILE);
-        } catch (error) {
-            console.error("ORDER HISTORY SAVE FAILED", error.message);
+            const tmp = `${HISTORY_FILE}.tmp`;
+            fs.writeFileSync(tmp, JSON.stringify(historyStore), "utf8");
+            fs.renameSync(tmp, HISTORY_FILE);
+        } catch (e) {
+            console.error("ORDER HISTORY SAVE FAILED", e.message);
         }
     }, 500);
 }
 
-function logJson(title, data) {
-    console.log("\n" + title);
-    try { console.log(JSON.stringify(data, null, 2)); }
-    catch (error) { console.log(String(data)); }
-}
-
-function normalizeMessage(message) {
-    if (typeof message !== "string") return message;
-    try { return JSON.parse(message); }
-    catch (error) { return message; }
-}
-
-function decodePluginFullData(raw) {
-    if (raw && typeof raw === "object" && !Buffer.isBuffer(raw) && !ArrayBuffer.isView(raw) && !Array.isArray(raw)) return raw;
-
-    let buffer = null;
-    if (Buffer.isBuffer(raw)) buffer = raw;
-    else if (raw instanceof Uint8Array) buffer = Buffer.from(raw);
-    else if (Array.isArray(raw) && raw.every(x => Number.isInteger(x) && x >= 0 && x <= 255)) buffer = Buffer.from(raw);
-    else if (typeof raw === "string") {
-        try {
-            const parsed = JSON.parse(raw);
-            if (parsed && typeof parsed === "object") return parsed;
-        } catch (_) {}
-        try { buffer = Buffer.from(raw, "base64"); } catch (_) {}
-    }
-
-    if (!buffer || !buffer.length) return null;
-
-    const attempts = [
-        () => zlib.gunzipSync(buffer),
-        () => zlib.unzipSync(buffer),
-        () => buffer
-    ];
-
-    for (const decode of attempts) {
-        try {
-            const text = decode().toString("utf8");
-            try { return JSON.parse(text); } catch (_) {}
-        } catch (_) {}
-    }
-    return null;
-}
-
-function findPlugin(body) {
-    const requestedSocketId = body.socketId || null;
-    const requestedPluginId = body.pluginId || null;
-    const requestedDepartmentId = body.departmentId || null;
-    const requestedGroupId = body.groupId || null;
-    if (requestedSocketId) return plugins.get(requestedSocketId) || null;
-    if (requestedPluginId) for (const plugin of plugins.values()) if (String(plugin.pluginId) === String(requestedPluginId)) return plugin;
-    if (requestedDepartmentId) for (const plugin of plugins.values()) if (String(plugin.departmentId) === String(requestedDepartmentId)) return plugin;
-    if (requestedGroupId) for (const plugin of plugins.values()) if (String(plugin.groupId) === String(requestedGroupId)) return plugin;
-    if (plugins.size === 1) return plugins.values().next().value;
-    return null;
+function now() { return new Date().toISOString(); }
+function requestId() { return crypto.randomUUID(); }
+function normalize(value) {
+    if (typeof value !== "string") return value;
+    try { return JSON.parse(value); } catch (_) { return value; }
 }
 
 const requestTypeByAction = {
     get_sales: "summaryOfRestaurant",
-    get_orders: "getFullDataReport",
+    get_orders: "currentShiftOrdersList",
     get_payments: "summaryOfRestaurant",
     get_products: "topTenMealsByRevenue",
     get_employees: "revenueByWaiters"
 };
 
-function mergeOrderEvent(plugin, event) {
-    if (!event || typeof event !== "object") return;
-    const data = event.data;
-    if (!data || typeof data !== "object") return;
-    const number = data.orderNum ?? data.orderNumber ?? data.number;
-    if (number === null || number === undefined || number === "") return;
+function findPlugin(body = {}) {
+    if (body.socketId && plugins.has(body.socketId)) return plugins.get(body.socketId);
+    for (const plugin of plugins.values()) {
+        if (body.pluginId && String(plugin.pluginId) === String(body.pluginId)) return plugin;
+        if (body.departmentId && String(plugin.departmentId) === String(body.departmentId)) return plugin;
+        if (body.groupId && String(plugin.groupId) === String(body.groupId)) return plugin;
+    }
+    return plugins.size === 1 ? plugins.values().next().value : null;
+}
 
+function orderNumber(data) {
+    if (!data || typeof data !== "object") return null;
+    return data.orderNum ?? data.orderNumber ?? data.OrderNum ?? data.Number ?? data.number ?? null;
+}
+
+function mergeOrderEvent(plugin, event) {
+    const data = event?.data;
+    const number = orderNumber(data);
+    if (number === null || number === undefined || number === "") return;
     const key = String(number);
-    const previous = plugin.orderDetails.get(key) || {};
+    const old = plugin.orderDetails.get(key) || {};
     plugin.orderDetails.set(key, {
-        ...previous,
+        ...old,
         orderNum: number,
-        tables: data.tables ?? previous.tables ?? null,
-        floor: data.floor ?? previous.floor ?? null,
-        waiter: data.waiter ?? previous.waiter ?? null,
-        cashier: data.cashier ?? previous.cashier ?? null,
-        revenue: data.revenue ?? previous.revenue ?? null,
-        openTime: data.openTime ?? previous.openTime ?? null,
-        billTime: data.billTime ?? previous.billTime ?? null,
-        closeTime: data.closeTime ?? previous.closeTime ?? null,
-        lastEventType: event.pluginEventType ?? previous.lastEventType ?? null,
+        tables: data.tables ?? old.tables ?? null,
+        floor: data.floor ?? old.floor ?? null,
+        waiter: data.waiter ?? old.waiter ?? null,
+        cashier: data.cashier ?? old.cashier ?? null,
+        revenue: data.revenue ?? old.revenue ?? null,
+        openTime: data.openTime ?? old.openTime ?? null,
+        billTime: data.billTime ?? old.billTime ?? null,
+        closeTime: data.closeTime ?? old.closeTime ?? null,
+        lastEventType: event.pluginEventType ?? old.lastEventType ?? null,
         lastEventAt: now()
     });
 }
 
-function recordOrderHistory(plugin, event) {
-    if (!event || typeof event !== "object") return;
-    const data = event.data;
-    if (!data || typeof data !== "object") return;
-    const number = data.orderNum ?? data.orderNumber ?? data.number;
+function recordHistory(plugin, event) {
+    const data = event?.data;
+    const number = orderNumber(data);
     if (number === null || number === undefined || number === "") return;
 
-    const pluginKey = String(plugin.pluginId || "unknown");
-    const orderKey = String(number);
-    if (!historyStore[pluginKey] || typeof historyStore[pluginKey] !== "object") historyStore[pluginKey] = {};
-    if (!Array.isArray(historyStore[pluginKey][orderKey])) historyStore[pluginKey][orderKey] = [];
+    const pk = String(plugin.pluginId || "unknown");
+    const ok = String(number);
+    if (!historyStore[pk] || typeof historyStore[pk] !== "object") historyStore[pk] = {};
+    if (!Array.isArray(historyStore[pk][ok])) historyStore[pk][ok] = [];
 
-    const list = historyStore[pluginKey][orderKey];
+    const list = historyStore[pk][ok];
     const uuid = event.uuid || null;
-    if (uuid && list.some(item => item.uuid === uuid)) return;
+    if (uuid && list.some(x => x.uuid === uuid)) return;
 
     list.push({
         uuid,
@@ -174,27 +124,18 @@ function recordOrderHistory(plugin, event) {
         data
     });
     if (list.length > MAX_EVENTS_PER_ORDER) list.splice(0, list.length - MAX_EVENTS_PER_ORDER);
-    scheduleHistorySave();
+    plugin.orderHistory.set(ok, list);
+    saveHistory();
 }
 
-function attachPluginHistory(plugin) {
-    const pluginKey = String(plugin.pluginId || "unknown");
-    const saved = historyStore[pluginKey];
-    plugin.orderHistory = new Map();
-    if (!saved || typeof saved !== "object") return;
-    for (const [orderKey, events] of Object.entries(saved)) {
-        if (Array.isArray(events)) plugin.orderHistory.set(orderKey, events);
-    }
-}
-
-function enrichOrders(value, orderDetails) {
+function enrichOrders(value, details) {
+    if (Array.isArray(value)) return value.map(x => enrichOrders(x, details));
     if (!value || typeof value !== "object") return value;
-    if (Array.isArray(value)) return value.map(item => enrichOrders(item, orderDetails));
 
     const result = { ...value };
-    const number = result.orderNum ?? result.OrderNum ?? result.orderNumber ?? result.OrderNumber ?? result.number ?? result.Number;
+    const number = orderNumber(result);
     if (number !== null && number !== undefined && number !== "") {
-        const extra = orderDetails.get(String(number));
+        const extra = details.get(String(number));
         if (extra) {
             if (result.waiter == null && result.Waiter == null) result.waiter = extra.waiter;
             if (result.cashier == null && result.Cashier == null) result.cashier = extra.cashier;
@@ -206,19 +147,8 @@ function enrichOrders(value, orderDetails) {
             if (result.closeTime == null && result.CloseTime == null && result.orderCloseTime == null && result.OrderCloseTime == null) result.closeTime = extra.closeTime;
         }
     }
-
-    for (const [key, child] of Object.entries(result)) result[key] = enrichOrders(child, orderDetails);
+    for (const [key, child] of Object.entries(result)) result[key] = enrichOrders(child, details);
     return result;
-}
-
-function findPendingOrderRequest(pluginSocketId) {
-    let found = null;
-    for (const pending of pendingRequests.values()) {
-        if (pending.action !== "get_orders") continue;
-        if (pending.pluginSocketId !== pluginSocketId) continue;
-        if (!found || pending.createdAt < found.createdAt) found = pending;
-    }
-    return found;
 }
 
 app.get("/api/health", (req, res) => res.json({
@@ -241,93 +171,102 @@ app.post("/api/iiko/connect", (req, res) => res.json({
 }));
 
 app.get("/api/plugin/status", (req, res) => {
-    const result = [];
-    for (const [socketId, plugin] of plugins.entries()) result.push({
-        socketId, pluginId: plugin.pluginId, pluginName: plugin.pluginName,
-        departmentId: plugin.departmentId, departmentName: plugin.departmentName,
-        groupId: plugin.groupId, groupName: plugin.groupName, version: plugin.version,
-        currencyCode: plugin.currencyCode, serverUrl: plugin.serverUrl,
-        connectedAt: plugin.connectedAt, lastEventAt: plugin.lastEventAt, lastResponseAt: plugin.lastResponseAt
+    res.json({
+        success: true,
+        count: plugins.size,
+        plugins: Array.from(plugins.values()).map(p => ({
+            socketId: p.socketId,
+            pluginId: p.pluginId,
+            pluginName: p.pluginName,
+            departmentId: p.departmentId,
+            departmentName: p.departmentName,
+            groupId: p.groupId,
+            groupName: p.groupName,
+            version: p.version,
+            currencyCode: p.currencyCode,
+            serverUrl: p.serverUrl,
+            connectedAt: p.connectedAt,
+            lastEventAt: p.lastEventAt,
+            lastResponseAt: p.lastResponseAt
+        }))
     });
-    res.json({ success: true, count: result.length, plugins: result });
 });
 
-app.post("/api/plugin/request", async (req, res) => {
+app.post("/api/plugin/request", (req, res) => {
     const body = req.body || {};
     const action = body.action;
-    if (!action) return res.status(400).json({ success: false, error: "action is required" });
-    const requestType = requestTypeByAction[action];
-    if (!requestType) return res.status(400).json({ success: false, error: "Unsupported plugin action", action, supportedActions: Object.keys(requestTypeByAction) });
+    const type = requestTypeByAction[action];
+    if (!action || !type) return res.status(400).json({ success: false, error: "Unsupported plugin action", action });
 
     const plugin = findPlugin(body);
     if (!plugin) return res.status(503).json({ success: false, error: "No connected plugin found", connectedPlugins: plugins.size });
 
-    const requestId = generateRequestId();
-    const request = { chatId: "", requestId, requestType, requestDetail: JSON.stringify(body.params || {}) };
-    logJson("========== SITE -> PLUGIN REQUEST ==========", { socketId: plugin.socketId, pluginId: plugin.pluginId, action, request });
+    const id = requestId();
+    const request = {
+        chatId: "",
+        requestId: id,
+        requestType: type,
+        requestDetail: JSON.stringify(body.params || {})
+    };
 
-    return new Promise((resolve) => {
-        let finished = false;
-        const finish = (statusCode, payload) => {
-            if (finished) return;
-            finished = true;
+    return new Promise(resolve => {
+        let done = false;
+        const finish = (status, payload) => {
+            if (done) return;
+            done = true;
             clearTimeout(timer);
-            pendingRequests.delete(requestId);
-            resolve(res.status(statusCode).json(payload));
+            pendingRequests.delete(id);
+            resolve(res.status(status).json(payload));
         };
-        const timer = setTimeout(() => finish(504, { success: false, error: "Plugin request timeout", requestId, action }), REQUEST_TIMEOUT_MS);
-        pendingRequests.set(requestId, { requestId, finish, timer, action, pluginSocketId: plugin.socketId, createdAt: now() });
+        const timer = setTimeout(() => finish(504, {
+            success: false,
+            error: "Plugin request timeout",
+            requestId: id,
+            action
+        }), REQUEST_TIMEOUT_MS);
+
+        pendingRequests.set(id, {
+            requestId: id,
+            action,
+            pluginSocketId: plugin.socketId,
+            createdAt: now(),
+            finish
+        });
 
         try {
             plugin.socket.emit("server_to_plugin", request);
-            console.log("REQUEST SENT TO PLUGIN", requestId, requestType, action);
-        } catch (error) {
-            finish(500, { success: false, error: "Failed to send request to plugin", requestId, details: error.message });
+        } catch (e) {
+            finish(500, { success: false, error: e.message, requestId: id, action });
         }
     });
 });
 
 app.get("/api/plugin/order-history", (req, res) => {
-    const orderNum = req.query.orderNum;
-    if (orderNum === undefined || orderNum === null || orderNum === "") return res.status(400).json({ success: false, error: "orderNum is required" });
-
-    const plugin = findPlugin({
-        socketId: req.query.socketId,
-        pluginId: req.query.pluginId,
-        departmentId: req.query.departmentId,
-        groupId: req.query.groupId
-    });
+    const number = req.query.orderNum;
+    if (number === undefined || number === null || number === "") return res.status(400).json({ success: false, error: "orderNum is required" });
+    const plugin = findPlugin(req.query);
     if (!plugin) return res.status(503).json({ success: false, error: "No connected plugin found", connectedPlugins: plugins.size });
 
-    const pluginKey = String(plugin.pluginId || "unknown");
-    const saved = historyStore[pluginKey]?.[String(orderNum)];
-    const live = plugin.orderHistory?.get(String(orderNum));
-    const history = Array.isArray(live) ? live : Array.isArray(saved) ? saved : [];
-
-    res.json({
-        success: true,
-        pluginId: plugin.pluginId,
-        orderNum: String(orderNum),
-        count: history.length,
-        history
-    });
+    const pk = String(plugin.pluginId || "unknown");
+    const history = historyStore[pk]?.[String(number)] || plugin.orderHistory.get(String(number)) || [];
+    res.json({ success: true, pluginId: plugin.pluginId, orderNum: String(number), count: history.length, history });
 });
 
-pluginIO.on("connection", (socket) => {
-    const query = socket.handshake.query || {};
-    const auth = socket.handshake.auth || {};
+pluginIO.on("connection", socket => {
+    const q = socket.handshake.query || {};
+    const a = socket.handshake.auth || {};
     const plugin = {
         socket,
         socketId: socket.id,
-        pluginId: query.pluginId || auth.pluginId || null,
-        pluginName: query.pluginName || auth.pluginName || null,
-        departmentId: query.departmentId || auth.departmentId || null,
-        departmentName: query.departmentName || auth.departmentName || null,
-        groupId: query.groupId || auth.groupId || null,
-        groupName: query.groupName || auth.groupName || null,
-        version: query.version || auth.version || null,
-        currencyCode: query.currencyCode || auth.currencyCode || null,
-        serverUrl: auth.serverUrl || null,
+        pluginId: q.pluginId || a.pluginId || null,
+        pluginName: q.pluginName || a.pluginName || null,
+        departmentId: q.departmentId || a.departmentId || null,
+        departmentName: q.departmentName || a.departmentName || null,
+        groupId: q.groupId || a.groupId || null,
+        groupName: q.groupName || a.groupName || null,
+        version: q.version || a.version || null,
+        currencyCode: q.currencyCode || a.currencyCode || null,
+        serverUrl: a.serverUrl || null,
         connectedAt: now(),
         lastEventAt: null,
         lastResponseAt: null,
@@ -335,17 +274,19 @@ pluginIO.on("connection", (socket) => {
         orderDetails: new Map(),
         orderHistory: new Map()
     };
-    attachPluginHistory(plugin);
-    plugins.set(socket.id, plugin);
 
+    const saved = historyStore[String(plugin.pluginId || "unknown")];
+    if (saved) for (const [key, list] of Object.entries(saved)) if (Array.isArray(list)) plugin.orderHistory.set(key, list);
+
+    plugins.set(socket.id, plugin);
     console.log("PLUGIN CONNECTED", socket.id, plugin.pluginId, plugin.pluginName);
 
-    socket.on("plugin_to_server", (rawMessage) => {
-        const message = normalizeMessage(rawMessage);
-        logJson("========== plugin_to_server ==========", message);
+    socket.on("plugin_to_server", raw => {
+        const message = normalize(raw);
         plugin.lastResponseAt = now();
         plugin.lastEventAt = now();
-        if (message && typeof message === "object" && !Array.isArray(message)) {
+
+        if (message && typeof message === "object") {
             plugin.pluginId = message.pluginId || plugin.pluginId;
             plugin.pluginName = message.pluginName || plugin.pluginName;
             plugin.departmentId = message.departmentId || plugin.departmentId;
@@ -357,9 +298,9 @@ pluginIO.on("connection", (socket) => {
             plugin.serverUrl = message.serverUrl || plugin.serverUrl;
         }
 
-        const requestId = message && typeof message === "object" ? message.requestId : null;
-        if (!requestId) return;
-        const pending = pendingRequests.get(requestId);
+        const id = message?.requestId;
+        if (!id) return;
+        const pending = pendingRequests.get(id);
         if (!pending) return;
 
         let data = message.data !== undefined ? message.data : null;
@@ -367,79 +308,50 @@ pluginIO.on("connection", (socket) => {
 
         pending.finish(200, {
             success: message.success !== false,
-            requestId,
+            requestId: id,
             action: pending.action,
             data,
             error: message.error || null
         });
     });
 
-    socket.on("plugin_to_server_event", (event) => {
-        logJson("========== plugin_to_server_event ==========", event);
+    socket.on("plugin_to_server_event", event => {
         plugin.lastEventAt = now();
         plugin.lastEvent = event;
         mergeOrderEvent(plugin, event);
-        recordOrderHistory(plugin, event);
-        const number = event?.data?.orderNum ?? event?.data?.orderNumber ?? event?.data?.number;
-        if (number !== null && number !== undefined && number !== "") {
-            const pluginKey = String(plugin.pluginId || "unknown");
-            const saved = historyStore[pluginKey]?.[String(number)];
-            if (Array.isArray(saved)) plugin.orderHistory.set(String(number), saved);
-        }
+        recordHistory(plugin, event);
     });
 
-    socket.on("plugin_to_server_full", (rawData, callback) => {
-        logJson("========== plugin_to_server_full ==========", {
-            type: Buffer.isBuffer(rawData) ? "Buffer" : typeof rawData,
-            bytes: Buffer.isBuffer(rawData) ? rawData.length : undefined
-        });
-        plugin.lastEventAt = now();
-
-        const decoded = decodePluginFullData(rawData);
-        if (!decoded) {
-            console.log("FULL REPORT DECODE FAILED");
-            if (typeof callback === "function") callback({ success: false, error: "Failed to decode full plugin report" });
-            return;
-        }
-
-        const pending = findPendingOrderRequest(socket.id);
-        if (pending) {
-            const data = enrichOrders(decoded.Data ?? decoded.data ?? decoded, plugin.orderDetails);
-            const responseRequestId = pending.requestId;
-            pending.finish(200, {
-                success: true,
-                requestId: responseRequestId,
-                action: "get_orders",
-                data,
-                error: null
-            });
-        }
-
-        if (typeof callback === "function") callback({ success: true, receivedAt: now() });
-    });
-
-    socket.on("plugin_ping", (data, callback) => {
-        if (typeof callback === "function") callback({ success: true, serverTime: now(), received: data || null });
-    });
-
-    socket.on("disconnect", (reason) => {
+    socket.on("disconnect", reason => {
         console.log("PLUGIN DISCONNECTED", socket.id, plugin.pluginId, reason);
-        for (const [requestId, pending] of pendingRequests.entries()) {
-            if (pending.pluginSocketId !== socket.id) continue;
-            pending.finish(503, { success: false, error: "Plugin disconnected", requestId, action: pending.action });
+        for (const pending of pendingRequests.values()) {
+            if (pending.pluginSocketId === socket.id) pending.finish(503, {
+                success: false,
+                error: "Plugin disconnected",
+                requestId: pending.requestId,
+                action: pending.action
+            });
         }
         plugins.delete(socket.id);
     });
 });
 
 app.get("/api/plugin/data", (req, res) => {
-    const result = Array.from(plugins.values()).map((plugin) => ({
-        pluginId: plugin.pluginId, pluginName: plugin.pluginName,
-        departmentId: plugin.departmentId, departmentName: plugin.departmentName,
-        groupId: plugin.groupId, groupName: plugin.groupName, version: plugin.version,
-        lastEventAt: plugin.lastEventAt, data: plugin.lastEvent || null
-    }));
-    res.json({ success: true, count: result.length, plugins: result });
+    res.json({
+        success: true,
+        count: plugins.size,
+        plugins: Array.from(plugins.values()).map(p => ({
+            pluginId: p.pluginId,
+            pluginName: p.pluginName,
+            departmentId: p.departmentId,
+            departmentName: p.departmentName,
+            groupId: p.groupId,
+            groupName: p.groupName,
+            version: p.version,
+            lastEventAt: p.lastEventAt,
+            data: p.lastEvent || null
+        }))
+    });
 });
 
 httpServer.listen(PORT, "127.0.0.1", () => {
