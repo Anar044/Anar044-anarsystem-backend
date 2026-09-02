@@ -1,0 +1,88 @@
+name: Repair order fields
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  repair:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Patch backend
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('server.js')
+          s = p.read_text()
+          old = '''function valueByNames(data, names) {
+              if (!data || typeof data !== "object") return null;
+              const wanted = names.map(x => String(x).toLowerCase());
+              for (const [key, value] of Object.entries(data)) {
+                  if (wanted.includes(key.toLowerCase()) && value !== null && value !== undefined && value !== "") return value;
+              }
+              return null;
+          }
+          '''
+          new = '''function valueByNames(data, names, depth = 0) {
+              if (!data || typeof data !== "object" || depth > 12) return null;
+              const wanted = names.map(x => String(x).toLowerCase());
+              for (const [key, value] of Object.entries(data)) {
+                  if (wanted.includes(key.toLowerCase()) && value !== null && value !== undefined && value !== "") return value;
+              }
+              for (const child of Object.values(data)) {
+                  const found = valueByNames(child, names, depth + 1);
+                  if (found !== null && found !== undefined && found !== "") return found;
+              }
+              return null;
+          }
+          '''
+          if old not in s:
+              raise SystemExit('valueByNames block not found')
+          s = s.replace(old, new, 1)
+
+          old_merge = '''        tables: data.tables ?? data.orderTables ?? old.tables ?? null,
+              floor: data.floor ?? data.floorName ?? old.floor ?? null,
+              waiter: data.waiter ?? data.waiterName ?? old.waiter ?? null,
+              cashier: data.cashier ?? data.cashierName ?? old.cashier ?? null,
+              revenue: data.revenue ?? data.resultSum ?? data.orderSum ?? old.revenue ?? null,
+              payments: data.payments ?? data.payment ?? data.paymentType ?? data.paymentTypeName ?? old.payments ?? null,
+              openTime: data.openTime ?? data.orderOpenDate ?? old.openTime ?? null,
+              billTime: data.billTime ?? data.orderBillTime ?? old.billTime ?? null,
+              closeTime: data.closeTime ?? data.orderCloseTime ?? old.closeTime ?? null,'''
+          new_merge = '''        tables: valueByNames(data, ["tables", "orderTables", "table", "tableName"]) ?? old.tables ?? null,
+              floor: valueByNames(data, ["floor", "floorName", "restaurantSection", "section", "hall"]) ?? old.floor ?? null,
+              waiter: valueByNames(data, ["waiter", "waiterName", "waiterFullName", "employee", "employeeName", "employeeFullName"]) ?? old.waiter ?? null,
+              cashier: valueByNames(data, ["cashier", "cashierName", "cashierFullName"]) ?? old.cashier ?? null,
+              revenue: valueByNames(data, ["revenue", "resultSum", "orderSum", "sum", "total"]) ?? old.revenue ?? null,
+              payments: valueByNames(data, ["payments", "payment", "paymentType", "paymentTypeName", "paymentMethod", "paymentName"]) ?? old.payments ?? null,
+              openTime: valueByNames(data, ["openTime", "orderOpenDate", "openedAt", "openingTime"]) ?? old.openTime ?? null,
+              billTime: valueByNames(data, ["billTime", "orderBillTime", "precheckTime", "precheckAt"]) ?? old.billTime ?? null,
+              closeTime: valueByNames(data, ["closeTime", "orderCloseTime", "closedAt", "closingTime"]) ?? old.closeTime ?? null,'''
+          if old_merge not in s:
+              raise SystemExit('merge block not found')
+          s = s.replace(old_merge, new_merge, 1)
+
+          s = s.replace("""        const extra = details.get(String(number)) || historicalOrderDetails(plugin, number);""", """        const extra = details.get(String(number)) || historicalOrderDetails(plugin, number);""", 1)
+          p.write_text(s)
+          PY
+      - name: Commit repair
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add server.js
+          git diff --cached --quiet && exit 0
+          git commit -m "Fix nested order hall staff and payment fields"
+          git push
+      - name: Remove temporary workflow
+        if: always()
+        run: |
+          rm -f .github/workflows/repair-order-fields.yml
+          git add .github/workflows/repair-order-fields.yml
+          git diff --cached --quiet && exit 0
+          git commit -m "Remove temporary repair workflow"
+          git push
