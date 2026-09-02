@@ -57,10 +57,16 @@ function normalize(value) {
     if (typeof value !== "string") return value;
     try { return JSON.parse(value); } catch (_) { return value; }
 }
+function normalizeMessage(value) {
+    value = normalize(value);
+    if (Array.isArray(value) && value.length === 1) value = value[0];
+    return normalize(value);
+}
 
 const requestTypeByAction = {
     get_sales: "summaryOfRestaurant",
     get_orders: "currentShiftOrdersList",
+    get_order: "order",
     get_payments: "summaryOfRestaurant",
     get_products: "topTenMealsByRevenue",
     get_employees: "revenueByWaiters"
@@ -300,11 +306,17 @@ app.post("/api/plugin/request", (req, res) => {
     if (!plugin) return res.status(503).json({ success: false, error: "No connected plugin found", connectedPlugins: plugins.size });
 
     const id = requestId();
+    let requestDetail = JSON.stringify(body.params || {});
+    if (action === "get_order") {
+        const number = body.params?.orderNum ?? body.params?.orderNumber ?? body.orderNum ?? body.orderNumber;
+        requestDetail = String(number ?? "");
+    }
+
     const request = {
         chatId: "",
         requestId: id,
         requestType: type,
-        requestDetail: JSON.stringify(body.params || {})
+        requestDetail
     };
 
     return new Promise(resolve => {
@@ -381,7 +393,7 @@ pluginIO.on("connection", socket => {
     console.log("PLUGIN CONNECTED", socket.id, plugin.pluginId, plugin.pluginName);
 
     socket.on("plugin_to_server", raw => {
-        const message = normalize(raw);
+        const message = normalizeMessage(raw);
         plugin.lastResponseAt = now();
         plugin.lastEventAt = now();
 
@@ -397,7 +409,7 @@ pluginIO.on("connection", socket => {
             plugin.serverUrl = message.serverUrl || plugin.serverUrl;
         }
 
-        const id = message?.requestId;
+        const id = message?.requestId || message?.data?.requestId || message?.result?.requestId;
         if (!id) return;
         const pending = pendingRequests.get(id);
         if (!pending) return;
