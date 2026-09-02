@@ -96,6 +96,19 @@ function valueByNames(data, names) {
     return null;
 }
 
+function deepValueByNames(data, names, depth = 0) {
+    if (!data || typeof data !== "object" || depth > 12) return null;
+    const wanted = names.map(x => String(x).toLowerCase());
+    for (const [key, value] of Object.entries(data)) {
+        if (wanted.includes(key.toLowerCase()) && value !== null && value !== undefined && value !== "") return value;
+    }
+    for (const child of Object.values(data)) {
+        const found = deepValueByNames(child, names, depth + 1);
+        if (found !== null && found !== undefined && found !== "") return found;
+    }
+    return null;
+}
+
 function historicalOrderDetails(plugin, number) {
     const pk = String(plugin.pluginId || "unknown");
     const list = historyStore[pk]?.[String(number)] || plugin.orderHistory.get(String(number)) || [];
@@ -119,7 +132,7 @@ function historicalOrderDetails(plugin, number) {
         if (!data || typeof data !== "object") continue;
         for (const [target, names] of Object.entries(fields)) {
             if (result[target] == null) {
-                const value = valueByNames(data, names);
+                const value = deepValueByNames(data, names);
                 if (value != null) result[target] = value;
             }
         }
@@ -138,15 +151,15 @@ function mergeOrderEvent(plugin, event) {
     plugin.orderDetails.set(key, {
         ...old,
         orderNum: number,
-        tables: data.tables ?? data.orderTables ?? old.tables ?? null,
-        floor: data.floor ?? data.floorName ?? old.floor ?? null,
-        waiter: data.waiter ?? data.waiterName ?? old.waiter ?? null,
-        cashier: data.cashier ?? data.cashierName ?? old.cashier ?? null,
-        revenue: data.revenue ?? data.resultSum ?? data.orderSum ?? old.revenue ?? null,
-        payments: data.payments ?? data.payment ?? data.paymentType ?? data.paymentTypeName ?? old.payments ?? null,
-        openTime: data.openTime ?? data.orderOpenDate ?? old.openTime ?? null,
-        billTime: data.billTime ?? data.orderBillTime ?? old.billTime ?? null,
-        closeTime: data.closeTime ?? data.orderCloseTime ?? old.closeTime ?? null,
+        tables: deepValueByNames(data, ["tables", "orderTables", "table", "tableName"]) ?? old.tables ?? null,
+        floor: deepValueByNames(data, ["floor", "floorName", "restaurantSection", "section", "hall"]) ?? old.floor ?? null,
+        waiter: deepValueByNames(data, ["waiter", "waiterName", "waiterFullName", "employee", "employeeName", "employeeFullName"]) ?? old.waiter ?? null,
+        cashier: deepValueByNames(data, ["cashier", "cashierName", "cashierFullName"]) ?? old.cashier ?? null,
+        revenue: deepValueByNames(data, ["revenue", "resultSum", "orderSum", "sum", "total"]) ?? old.revenue ?? null,
+        payments: deepValueByNames(data, ["payments", "payment", "paymentType", "paymentTypeName", "paymentMethod", "paymentName"]) ?? old.payments ?? null,
+        openTime: deepValueByNames(data, ["openTime", "orderOpenDate", "openedAt", "openingTime"]) ?? old.openTime ?? null,
+        billTime: deepValueByNames(data, ["billTime", "orderBillTime", "precheckTime", "precheckAt"]) ?? old.billTime ?? null,
+        closeTime: deepValueByNames(data, ["closeTime", "orderCloseTime", "closedAt", "closingTime"]) ?? old.closeTime ?? null,
         lastEventType: event.pluginEventType ?? old.lastEventType ?? null,
         lastEventAt: now()
     });
