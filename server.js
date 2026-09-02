@@ -6,67 +6,32 @@ const { Server } = require("socket.io");
 
 const app = express();
 const httpServer = http.createServer(app);
-
 const PORT = 3000;
-
-// ============================================================
-// EXPRESS
-// ============================================================
+const REQUEST_TIMEOUT_MS = 30000;
 
 app.use(cors());
+app.use(express.json({ limit: "20mb" }));
 
-app.use(
-    express.json({
-        limit: "20mb"
-    })
-);
-
-// ============================================================
-// SOCKET.IO
-// ============================================================
-
+// HorecaControlPlugin connects to this Socket.IO namespace/path.
 const io = new Server(httpServer, {
     path: "/plugin-websocket/socket.io",
-
     cors: {
         origin: "*",
         methods: ["GET", "POST"]
     },
-
-    // HorecaControlPlugin uses polling with AutoUpgrade=false.
-    // Keep the transport strictly on polling.
     transports: ["polling", "websocket"],
-
-    // Give the polling connection a longer heartbeat window.
     pingInterval: 25000,
-    pingTimeout: 20000,
-
-    // Do not aggressively close idle polling connections.
+    pingTimeout: 60000,
     connectTimeout: 120000
 });
 
-// Namespace for HorecaControl plugins
 const pluginIO = io.of("/plugin-websocket");
 
-// ============================================================
-// CONNECTED PLUGINS
-// ============================================================
-
-// socket.id -> plugin
+// socket.id -> plugin information
 const plugins = new Map();
 
 // requestId -> pending HTTP request
 const pendingRequests = new Map();
-
-// ============================================================
-// SETTINGS
-// ============================================================
-
-const REQUEST_TIMEOUT_MS = 30000;
-
-// ============================================================
-// HELPERS
-// ============================================================
 
 function now() {
     return new Date().toISOString();
@@ -77,1242 +42,428 @@ function generateRequestId() {
 }
 
 function logJson(title, data) {
-    console.log("");
-    console.log(title);
-
+    console.log("\n" + title);
     try {
-        console.log(
-            JSON.stringify(data, null, 2)
-        );
+        console.log(JSON.stringify(data, null, 2));
     } catch (error) {
         console.log(String(data));
     }
 }
 
-// ============================================================
-// FIND PLUGIN
-// ============================================================
+function normalizeMessage(message) {
+    if (typeof message !== "string") {
+        return message;
+    }
+
+    try {
+        return JSON.parse(message);
+    } catch (error) {
+        return message;
+    }
+}
 
 function findPlugin(body) {
-
-    const requestedSocketId =
-        body.socketId || null;
-
-    const requestedPluginId =
-        body.pluginId || null;
-
-    const requestedDepartmentId =
-        body.departmentId || null;
-
-    const requestedGroupId =
-        body.groupId || null;
-
-
-    // --------------------------------------------------------
-    // 1. socketId
-    // --------------------------------------------------------
+    const requestedSocketId = body.socketId || null;
+    const requestedPluginId = body.pluginId || null;
+    const requestedDepartmentId = body.departmentId || null;
+    const requestedGroupId = body.groupId || null;
 
     if (requestedSocketId) {
-
-        const plugin =
-            plugins.get(requestedSocketId);
-
-        if (plugin) {
-            return plugin;
-        }
-
-        return null;
+        return plugins.get(requestedSocketId) || null;
     }
-
-
-    // --------------------------------------------------------
-    // 2. pluginId
-    // --------------------------------------------------------
 
     if (requestedPluginId) {
-
         for (const plugin of plugins.values()) {
-
-            if (
-                String(plugin.pluginId) ===
-                String(requestedPluginId)
-            ) {
+            if (String(plugin.pluginId) === String(requestedPluginId)) {
                 return plugin;
             }
         }
     }
-
-
-    // --------------------------------------------------------
-    // 3. departmentId
-    // --------------------------------------------------------
 
     if (requestedDepartmentId) {
-
         for (const plugin of plugins.values()) {
-
-            if (
-                String(plugin.departmentId) ===
-                String(requestedDepartmentId)
-            ) {
+            if (String(plugin.departmentId) === String(requestedDepartmentId)) {
                 return plugin;
             }
         }
     }
-
-
-    // --------------------------------------------------------
-    // 4. groupId
-    // --------------------------------------------------------
 
     if (requestedGroupId) {
-
         for (const plugin of plugins.values()) {
-
-            if (
-                String(plugin.groupId) ===
-                String(requestedGroupId)
-            ) {
+            if (String(plugin.groupId) === String(requestedGroupId)) {
                 return plugin;
             }
         }
     }
 
-
-    // --------------------------------------------------------
-    // 5. Only one connected plugin
-    // --------------------------------------------------------
-
     if (plugins.size === 1) {
-
-        return (
-            plugins.values().next().value
-        );
+        return plugins.values().next().value;
     }
-
 
     return null;
 }
+
+// UI action -> EnumRequestType used by HorecaControlPlugin.
+const requestTypeByAction = {
+    get_sales: "summaryOfRestaurant",
+    get_orders: "currentShiftOrdersList",
+    get_payments: "summaryOfRestaurant",
+    get_products: "topTenMealsByRevenue",
+    get_employees: "revenueByWaiters"
+};
 
 // ============================================================
 // HEALTH
 // ============================================================
 
-app.get(
-    "/api/health",
-    (req, res) => {
-
-        res.json({
-
-            success: true,
-
-            service:
-                "AnarSystem API",
-
-            server:
-                "Oracle VPS",
-
-            node:
-                process.version,
-
-            time:
-                now(),
-
-            socketIo:
-                true,
-
-            socketIoPath:
-                "/plugin-websocket/socket.io",
-
-            socketIoNamespace:
-                "/plugin-websocket",
-
-            connectedPlugins:
-                plugins.size,
-
-            pendingRequests:
-                pendingRequests.size
-        });
-    }
-);
+app.get("/api/health", (req, res) => {
+    res.json({
+        success: true,
+        service: "AnarSystem API",
+        server: "Oracle VPS",
+        node: process.version,
+        time: now(),
+        socketIo: true,
+        socketIoPath: "/plugin-websocket/socket.io",
+        socketIoNamespace: "/plugin-websocket",
+        connectedPlugins: plugins.size,
+        pendingRequests: pendingRequests.size
+    });
+});
 
 // ============================================================
 // IIKO CONNECT TEST
 // ============================================================
 
-app.post(
-    "/api/iiko/connect",
-    async (req, res) => {
-
-        res.json({
-
-            success: true,
-
-            message:
-                "AnarSystem API работает",
-
-            received: {
-
-                ip:
-                    req.body.ip || null,
-
-                port:
-                    req.body.port || null,
-
-                login:
-                    req.body.login || null
-            }
-        });
-    }
-);
+app.post("/api/iiko/connect", (req, res) => {
+    res.json({
+        success: true,
+        message: "AnarSystem API работает",
+        received: {
+            ip: req.body.ip || null,
+            port: req.body.port || null,
+            login: req.body.login || null
+        }
+    });
+});
 
 // ============================================================
 // PLUGIN STATUS
 // ============================================================
 
-app.get(
-    "/api/plugin/status",
-    (req, res) => {
+app.get("/api/plugin/status", (req, res) => {
+    const result = [];
 
-        const result = [];
-
-        for (
-            const [socketId, plugin]
-            of plugins.entries()
-        ) {
-
-            result.push({
-
-                socketId,
-
-                pluginId:
-                    plugin.pluginId,
-
-                pluginName:
-                    plugin.pluginName,
-
-                departmentId:
-                    plugin.departmentId,
-
-                departmentName:
-                    plugin.departmentName,
-
-                groupId:
-                    plugin.groupId,
-
-                groupName:
-                    plugin.groupName,
-
-                version:
-                    plugin.version,
-
-                currencyCode:
-                    plugin.currencyCode,
-
-                serverUrl:
-                    plugin.serverUrl,
-
-                connectedAt:
-                    plugin.connectedAt,
-
-                lastEventAt:
-                    plugin.lastEventAt,
-
-                lastResponseAt:
-                    plugin.lastResponseAt
-            });
-        }
-
-        res.json({
-
-            success: true,
-
-            count:
-                result.length,
-
-            plugins:
-                result
+    for (const [socketId, plugin] of plugins.entries()) {
+        result.push({
+            socketId,
+            pluginId: plugin.pluginId,
+            pluginName: plugin.pluginName,
+            departmentId: plugin.departmentId,
+            departmentName: plugin.departmentName,
+            groupId: plugin.groupId,
+            groupName: plugin.groupName,
+            version: plugin.version,
+            currencyCode: plugin.currencyCode,
+            serverUrl: plugin.serverUrl,
+            connectedAt: plugin.connectedAt,
+            lastEventAt: plugin.lastEventAt,
+            lastResponseAt: plugin.lastResponseAt
         });
     }
-);
+
+    res.json({
+        success: true,
+        count: result.length,
+        plugins: result
+    });
+});
 
 // ============================================================
 // SITE -> PLUGIN REQUEST
 // ============================================================
-//
-// POST /api/plugin/request
-//
-// Example:
-//
-// {
-//   "action": "get_sales",
-//   "pluginId": "TEST-PLUGIN-001",
-//   "params": {
-//      "dateFrom": "2026-08-29",
-//      "dateTo": "2026-08-29"
-//   }
-// }
-//
-// ============================================================
 
-app.post(
-    "/api/plugin/request",
-    async (req, res) => {
+app.post("/api/plugin/request", async (req, res) => {
+    const body = req.body || {};
+    const action = body.action;
 
-        const body =
-            req.body || {};
+    if (!action) {
+        return res.status(400).json({
+            success: false,
+            error: "action is required"
+        });
+    }
 
-        const action =
-            body.action;
+    const requestType = requestTypeByAction[action];
 
-
-        // ------------------------------------------------------
-        // ACTION REQUIRED
-        // ------------------------------------------------------
-
-        if (!action) {
-
-            return res.status(400).json({
-
-                success: false,
-
-                error:
-                    "action is required"
-            });
-        }
-
-
-        // ------------------------------------------------------
-        // FIND PLUGIN
-        // ------------------------------------------------------
-
-        const plugin =
-            findPlugin(body);
-
-
-        if (!plugin) {
-
-            return res.status(503).json({
-
-                success: false,
-
-                error:
-                    "No connected plugin found",
-
-                connectedPlugins:
-                    plugins.size
-            });
-        }
-
-
-        // ------------------------------------------------------
-        // REQUEST ID
-        // ------------------------------------------------------
-
-        const requestId =
-            generateRequestId();
-
-
-        const request = {
-
-            requestId,
-
+    if (!requestType) {
+        return res.status(400).json({
+            success: false,
+            error: "Unsupported plugin action",
             action,
+            supportedActions: Object.keys(requestTypeByAction)
+        });
+    }
 
-            params:
-                body.params || {},
+    const plugin = findPlugin(body);
 
-            createdAt:
-                now()
+    if (!plugin) {
+        return res.status(503).json({
+            success: false,
+            error: "No connected plugin found",
+            connectedPlugins: plugins.size
+        });
+    }
+
+    const requestId = generateRequestId();
+
+    // IMPORTANT: HorecaControlPlugin listens for "server_to_plugin"
+    // and expects PluginEventData fields, especially requestType.
+    const request = {
+        chatId: "",
+        requestId,
+        requestType,
+        requestDetail: JSON.stringify(body.params || {})
+    };
+
+    logJson("========== SITE -> PLUGIN REQUEST ==========", {
+        socketId: plugin.socketId,
+        pluginId: plugin.pluginId,
+        action,
+        request
+    });
+
+    return new Promise((resolve) => {
+        let finished = false;
+
+        const finish = (statusCode, payload) => {
+            if (finished) {
+                return;
+            }
+
+            finished = true;
+            clearTimeout(timer);
+            pendingRequests.delete(requestId);
+            resolve(res.status(statusCode).json(payload));
         };
 
+        const timer = setTimeout(() => {
+            console.log("\n========== PLUGIN REQUEST TIMEOUT ==========");
+            console.log("Request ID:", requestId);
+            console.log("Action:", action);
 
-        logJson(
-            "========== SITE -> PLUGIN REQUEST ==========",
-            {
-                socketId:
-                    plugin.socketId,
+            finish(504, {
+                success: false,
+                error: "Plugin request timeout",
+                requestId,
+                action
+            });
+        }, REQUEST_TIMEOUT_MS);
 
-                pluginId:
-                    plugin.pluginId,
+        pendingRequests.set(requestId, {
+            finish,
+            timer,
+            action,
+            pluginSocketId: plugin.socketId,
+            createdAt: now()
+        });
 
-                request
-            }
-        );
+        try {
+            // This is the event name used by HorecaControlPlugin.
+            plugin.socket.emit("server_to_plugin", request);
 
-
-        // ------------------------------------------------------
-        // WAIT FOR PLUGIN RESPONSE
-        // ------------------------------------------------------
-
-        return new Promise(
-            (resolve) => {
-
-                const timer =
-                    setTimeout(
-                        () => {
-
-                            pendingRequests.delete(
-                                requestId
-                            );
-
-
-                            console.log("");
-
-                            console.log(
-                                "========== PLUGIN REQUEST TIMEOUT =========="
-                            );
-
-                            console.log(
-                                "Request ID:",
-                                requestId
-                            );
-
-                            console.log(
-                                "Action:",
-                                action
-                            );
-
-
-                            resolve(
-                                res.status(504).json({
-
-                                    success: false,
-
-                                    error:
-                                        "Plugin request timeout",
-
-                                    requestId,
-
-                                    action
-                                })
-                            );
-
-                        },
-                        REQUEST_TIMEOUT_MS
-                    );
-
-
-                pendingRequests.set(
-                    requestId,
-                    {
-                        resolve,
-
-                        timer,
-
-                        action,
-
-                        pluginSocketId:
-                            plugin.socketId,
-
-                        createdAt:
-                            now()
-                    }
-                );
-
-
-                // ------------------------------------------------
-                // SEND REQUEST TO PLUGIN
-                // ------------------------------------------------
-
-                try {
-
-                    plugin.socket.emit(
-                        "server_to_plugin_request",
-                        request
-                    );
-
-
-                    console.log("");
-
-                    console.log(
-                        "========== REQUEST SENT TO PLUGIN =========="
-                    );
-
-                    console.log(
-                        "Socket:",
-                        plugin.socketId
-                    );
-
-                    console.log(
-                        "Plugin ID:",
-                        plugin.pluginId
-                    );
-
-                    console.log(
-                        "Request ID:",
-                        requestId
-                    );
-
-                    console.log(
-                        "Action:",
-                        action
-                    );
-
-                } catch (error) {
-
-                    clearTimeout(
-                        timer
-                    );
-
-                    pendingRequests.delete(
-                        requestId
-                    );
-
-
-                    console.error("");
-
-                    console.error(
-                        "========== SEND ERROR =========="
-                    );
-
-                    console.error(
-                        error
-                    );
-
-
-                    resolve(
-                        res.status(500).json({
-
-                            success: false,
-
-                            error:
-                                "Failed to send request to plugin",
-
-                            requestId,
-
-                            details:
-                                error.message
-                        })
-                    );
-                }
-
-            }
-        );
-    }
-);
+            console.log("\n========== REQUEST SENT TO PLUGIN ==========");
+            console.log("Socket:", plugin.socketId);
+            console.log("Plugin ID:", plugin.pluginId);
+            console.log("Request ID:", requestId);
+            console.log("Request type:", requestType);
+            console.log("Action:", action);
+        } catch (error) {
+            finish(500, {
+                success: false,
+                error: "Failed to send request to plugin",
+                requestId,
+                details: error.message
+            });
+        }
+    });
+});
 
 // ============================================================
 // SOCKET.IO CONNECTION
 // ============================================================
 
-pluginIO.on(
-    "connection",
-    (socket) => {
-
-        console.log("");
-
-        console.log(
-            "================================="
-        );
-
-        console.log(
-            "=== SOCKET.IO CONNECTION ==="
-        );
-
-        console.log(
-            "================================="
-        );
-
-
-        console.log(
-            "ID:",
-            socket.id
-        );
-
-
-        console.log(
-            "NAMESPACE:",
-            socket.nsp.name
-        );
-
-
-        console.log(
-            "AUTH:",
-            JSON.stringify(
-                socket.handshake.auth,
-                null,
-                2
-            )
-        );
-
-
-        console.log(
-            "QUERY:",
-            JSON.stringify(
-                socket.handshake.query,
-                null,
-                2
-            )
-        );
-
-
-        console.log(
-            "================================="
-        );
-
-
-        // ======================================================
-        // HANDSHAKE DATA
-        // ======================================================
-
-        const query =
-            socket.handshake.query || {};
-
-        const auth =
-            socket.handshake.auth || {};
-
-
-        // ======================================================
-        // PLUGIN OBJECT
-        // ======================================================
-
-        const plugin = {
-
-            // IMPORTANT:
-            // Save the actual Socket.IO socket.
-            socket: socket,
-
-            socketId:
-                socket.id,
-
-            pluginId:
-                query.pluginId ||
-                auth.pluginId ||
-                null,
-
-            pluginName:
-                query.pluginName ||
-                auth.pluginName ||
-                null,
-
-            departmentId:
-                query.departmentId ||
-                auth.departmentId ||
-                null,
-
-            departmentName:
-                query.departmentName ||
-                auth.departmentName ||
-                null,
-
-            groupId:
-                query.groupId ||
-                auth.groupId ||
-                null,
-
-            groupName:
-                query.groupName ||
-                auth.groupName ||
-                null,
-
-            version:
-                query.version ||
-                auth.version ||
-                null,
-
-            currencyCode:
-                query.currencyCode ||
-                auth.currencyCode ||
-                null,
-
-            serverUrl:
-                auth.serverUrl ||
-                null,
-
-            connectedAt:
-                now(),
-
-            lastEventAt:
-                null,
-
-            lastResponseAt:
-                null
-        };
-
-
-        plugins.set(
-            socket.id,
-            plugin
-        );
-
-
-        // ======================================================
-        // CONNECTION LOG
-        // ======================================================
-
-        console.log("");
-
-        console.log(
-            "================================="
-        );
-
-        console.log(
-            "PLUGIN CONNECTED"
-        );
-
-        console.log(
-            "================================="
-        );
-
-        console.log(
-            "Socket:",
-            socket.id
-        );
-
-        console.log(
-            "Plugin ID:",
-            plugin.pluginId
-        );
-
-        console.log(
-            "Plugin Name:",
-            plugin.pluginName
-        );
-
-        console.log(
-            "Department ID:",
-            plugin.departmentId
-        );
-
-        console.log(
-            "Department Name:",
-            plugin.departmentName
-        );
-
-        console.log(
-            "Group ID:",
-            plugin.groupId
-        );
-
-        console.log(
-            "Group Name:",
-            plugin.groupName
-        );
-
-        console.log(
-            "Version:",
-            plugin.version
-        );
-
-        console.log(
-            "Currency:",
-            plugin.currencyCode
-        );
-
-        console.log(
-            "Server URL:",
-            plugin.serverUrl
-        );
-
-        console.log(
-            "Time:",
-            now()
-        );
-
-        console.log(
-            "================================="
-        );
-
-
-        // ======================================================
-        // PLUGIN -> SERVER
-        // IDENTITY / GENERAL MESSAGE
-        // ======================================================
-
-        socket.on(
-            "plugin_to_server",
-            (message) => {
-
-                console.log("");
-
-                console.log(
-                    "========== plugin_to_server =========="
-                );
-
-
-                logJson(
-                    "MESSAGE:",
-                    message
-                );
-
-
-                plugin.lastEventAt =
-                    now();
-
-
-                if (
-                    message &&
-                    typeof message === "object"
-                ) {
-
-                    plugin.pluginId =
-                        message.pluginId ||
-                        plugin.pluginId;
-
-                    plugin.pluginName =
-                        message.pluginName ||
-                        plugin.pluginName;
-
-                    plugin.departmentId =
-                        message.departmentId ||
-                        plugin.departmentId;
-
-                    plugin.departmentName =
-                        message.departmentName ||
-                        plugin.departmentName;
-
-                    plugin.groupId =
-                        message.groupId ||
-                        plugin.groupId;
-
-                    plugin.groupName =
-                        message.groupName ||
-                        plugin.groupName;
-
-                    plugin.version =
-                        message.version ||
-                        plugin.version;
-
-                    plugin.currencyCode =
-                        message.currencyCode ||
-                        plugin.currencyCode;
-
-                    plugin.serverUrl =
-                        message.serverUrl ||
-                        plugin.serverUrl;
-                }
-
+pluginIO.on("connection", (socket) => {
+    const query = socket.handshake.query || {};
+    const auth = socket.handshake.auth || {};
+
+    const plugin = {
+        socket,
+        socketId: socket.id,
+        pluginId: query.pluginId || auth.pluginId || null,
+        pluginName: query.pluginName || auth.pluginName || null,
+        departmentId: query.departmentId || auth.departmentId || null,
+        departmentName: query.departmentName || auth.departmentName || null,
+        groupId: query.groupId || auth.groupId || null,
+        groupName: query.groupName || auth.groupName || null,
+        version: query.version || auth.version || null,
+        currencyCode: query.currencyCode || auth.currencyCode || null,
+        serverUrl: auth.serverUrl || null,
+        connectedAt: now(),
+        lastEventAt: null,
+        lastResponseAt: null,
+        lastEvent: null
+    };
+
+    plugins.set(socket.id, plugin);
+
+    console.log("\n=================================");
+    console.log("PLUGIN CONNECTED");
+    console.log("=================================");
+    console.log("Socket:", socket.id);
+    console.log("Plugin ID:", plugin.pluginId);
+    console.log("Plugin Name:", plugin.pluginName);
+    console.log("Department ID:", plugin.departmentId);
+    console.log("Department Name:", plugin.departmentName);
+    console.log("Group ID:", plugin.groupId);
+    console.log("Group Name:", plugin.groupName);
+    console.log("Version:", plugin.version);
+    console.log("Server URL:", plugin.serverUrl);
+    console.log("Time:", now());
+
+    // ========================================================
+    // PLUGIN -> SERVER
+    // ========================================================
+    // Plugin.SendMessage(...) emits "plugin_to_server".
+    // This is also where request/response messages arrive.
+
+    socket.on("plugin_to_server", (rawMessage) => {
+        const message = normalizeMessage(rawMessage);
+
+        logJson("========== plugin_to_server ==========", message);
+
+        plugin.lastResponseAt = now();
+        plugin.lastEventAt = now();
+
+        if (message && typeof message === "object" && !Array.isArray(message)) {
+            plugin.pluginId = message.pluginId || plugin.pluginId;
+            plugin.pluginName = message.pluginName || plugin.pluginName;
+            plugin.departmentId = message.departmentId || plugin.departmentId;
+            plugin.departmentName = message.departmentName || plugin.departmentName;
+            plugin.groupId = message.groupId || plugin.groupId;
+            plugin.groupName = message.groupName || plugin.groupName;
+            plugin.version = message.version || plugin.version;
+            plugin.currencyCode = message.currencyCode || plugin.currencyCode;
+            plugin.serverUrl = message.serverUrl || plugin.serverUrl;
+        }
+
+        const requestId =
+            message && typeof message === "object"
+                ? message.requestId
+                : null;
+
+        if (!requestId) {
+            return;
+        }
+
+        const pending = pendingRequests.get(requestId);
+
+        if (!pending) {
+            console.log("No pending request for:", requestId);
+            return;
+        }
+
+        console.log("\n========== REQUEST COMPLETED ==========");
+        console.log("Request ID:", requestId);
+        console.log("Action:", pending.action);
+
+        pending.finish(200, {
+            success: message.success !== false,
+            requestId,
+            action: pending.action,
+            data: message.data !== undefined ? message.data : null,
+            error: message.error || null
+        });
+    });
+
+    // ========================================================
+    // PLUGIN EVENT
+    // ========================================================
+
+    socket.on("plugin_to_server_event", (event) => {
+        logJson("========== plugin_to_server_event ==========", event);
+
+        plugin.lastEventAt = now();
+
+        // Latest plugin packet is kept only in RAM.
+        plugin.lastEvent = event;
+    });
+
+    // ========================================================
+    // FULL DATA
+    // ========================================================
+
+    socket.on("plugin_to_server_full", (data, callback) => {
+        logJson("========== plugin_to_server_full ==========", data);
+        plugin.lastEventAt = now();
+
+        if (typeof callback === "function") {
+            callback({
+                success: true,
+                receivedAt: now()
+            });
+        }
+    });
+
+    // ========================================================
+    // PING
+    // ========================================================
+
+    socket.on("plugin_ping", (data, callback) => {
+        if (typeof callback === "function") {
+            callback({
+                success: true,
+                serverTime: now(),
+                received: data || null
+            });
+        }
+    });
+
+    // ========================================================
+    // DISCONNECT
+    // ========================================================
+
+    socket.on("disconnect", (reason) => {
+        console.log("\n=================================");
+        console.log("PLUGIN DISCONNECTED");
+        console.log("Socket:", socket.id);
+        console.log("Plugin ID:", plugin.pluginId);
+        console.log("Reason:", reason);
+        console.log("Time:", now());
+
+        for (const [requestId, pending] of pendingRequests.entries()) {
+            if (pending.pluginSocketId !== socket.id) {
+                continue;
             }
-        );
 
-
-        // ======================================================
-        // PLUGIN EVENT
-        // ======================================================
-
-        socket.on(
-            "plugin_to_server_event",
-            (event) => {
-
-                console.log("");
-
-                console.log(
-                    "========== plugin_to_server_event =========="
-                );
-
-
-                logJson(
-                    "EVENT:",
-                    event
-                );
-
-
-                plugin.lastEventAt =
-                    now();
-
-                // Последний пакет от плагина хранится только в RAM.
-                // База данных для данных iiko НЕ используется.
-                plugin.lastEvent = event;
-
-                if (
-                    event &&
-                    typeof event === "object"
-                ) {
-
-                    console.log(
-                        "Plugin event type:",
-                        event.pluginEventType ||
-                        "unknown"
-                    );
-
-                    console.log(
-                        "Plugin UUID:",
-                        event.uuid ||
-                        "unknown"
-                    );
-                }
-
-            }
-        );
-
-
-        // ======================================================
-        // FULL DATA
-        // ======================================================
-
-        socket.on(
-            "plugin_to_server_full",
-            (data, callback) => {
-
-                console.log("");
-
-                console.log(
-                    "========== plugin_to_server_full =========="
-                );
-
-
-                logJson(
-                    "DATA:",
-                    data
-                );
-
-
-                plugin.lastEventAt =
-                    now();
-
-
-                if (
-                    typeof callback ===
-                    "function"
-                ) {
-
-                    callback({
-
-                        success:
-                            true,
-
-                        receivedAt:
-                            now()
-                    });
-
-                }
-
-            }
-        );
-
-
-        // ======================================================
-        // PLUGIN RESPONSE
-        // ======================================================
-        //
-        // Plugin sends:
-        //
-        // {
-        //   requestId: "...",
-        //   success: true,
-        //   data: {...}
-        // }
-        //
-        // ======================================================
-
-        socket.on(
-            "plugin_to_server_response",
-            (response) => {
-
-                console.log("");
-
-                console.log(
-                    "========== PLUGIN RESPONSE =========="
-                );
-
-
-                logJson(
-                    "RESPONSE:",
-                    response
-                );
-
-
-                plugin.lastResponseAt =
-                    now();
-
-                plugin.lastEventAt =
-                    now();
-
-
-                if (
-                    !response ||
-                    typeof response !== "object"
-                ) {
-
-                    console.log(
-                        "Invalid plugin response."
-                    );
-
-                    return;
-                }
-
-
-                const requestId =
-                    response.requestId;
-
-
-                if (!requestId) {
-
-                    console.log(
-                        "Plugin response has no requestId."
-                    );
-
-                    return;
-                }
-
-
-                const pending =
-                    pendingRequests.get(
-                        requestId
-                    );
-
-
-                if (!pending) {
-
-                    console.log(
-                        "No pending request for:",
-                        requestId
-                    );
-
-                    return;
-                }
-
-
-                clearTimeout(
-                    pending.timer
-                );
-
-
-                pendingRequests.delete(
-                    requestId
-                );
-
-
-                console.log("");
-
-                console.log(
-                    "========== REQUEST COMPLETED =========="
-                );
-
-                console.log(
-                    "Request ID:",
-                    requestId
-                );
-
-                console.log(
-                    "Action:",
-                    pending.action
-                );
-
-
-                pending.resolve(
-                    res.json({
-
-                        success:
-                            response.success !== false,
-
-                        requestId,
-
-                        action:
-                            pending.action,
-
-                        data:
-                            response.data !== undefined
-                                ? response.data
-                                : null,
-
-                        error:
-                            response.error ||
-                            null
-                    })
-                );
-
-            }
-        );
-
-
-        // ======================================================
-        // PING
-        // ======================================================
-
-        socket.on(
-            "plugin_ping",
-            (data, callback) => {
-
-                console.log("");
-
-                console.log(
-                    "========== PLUGIN PING =========="
-                );
-
-
-                logJson(
-                    "DATA:",
-                    data
-                );
-
-
-                if (
-                    typeof callback ===
-                    "function"
-                ) {
-
-                    callback({
-
-                        success:
-                            true,
-
-                        serverTime:
-                            now(),
-
-                        received:
-                            data || null
-                    });
-
-                }
-
-            }
-        );
-
-
-        // ======================================================
-        // DISCONNECT
-        // ======================================================
-
-        socket.on(
-            "disconnect",
-            (reason) => {
-
-                console.log("");
-
-                console.log(
-                    "================================="
-                );
-
-                console.log(
-                    "PLUGIN DISCONNECTED"
-                );
-
-                console.log(
-                    "================================="
-                );
-
-                console.log(
-                    "Socket:",
-                    socket.id
-                );
-
-                console.log(
-                    "Plugin ID:",
-                    plugin.pluginId
-                );
-
-                console.log(
-                    "Reason:",
-                    reason
-                );
-
-                console.log(
-                    "Time:",
-                    now()
-                );
-
-
-                // ------------------------------------------------
-                // Finish pending requests for this plugin
-                // ------------------------------------------------
-
-                for (
-                    const [
-                        requestId,
-                        pending
-                    ]
-                    of pendingRequests.entries()
-                ) {
-
-                    if (
-                        pending.pluginSocketId ===
-                        socket.id
-                    ) {
-
-                        clearTimeout(
-                            pending.timer
-                        );
-
-                        pendingRequests.delete(
-                            requestId
-                        );
-
-
-                        pending.resolve(
-                            res.status(503).json({
-
-                                success:
-                                    false,
-
-                                error:
-                                    "Plugin disconnected",
-
-                                requestId,
-
-                                action:
-                                    pending.action
-                            })
-                        );
-
-                    }
-
-                }
-
-
-                plugins.delete(
-                    socket.id
-                );
-
-            }
-        );
-
-
-        // ======================================================
-        // DEBUG ALL SOCKET EVENTS
-        // ======================================================
-
-        socket.onAny(
-            (eventName, ...args) => {
-
-                console.log("");
-
-                console.log(
-                    "========== SOCKET EVENT =========="
-                );
-
-                console.log(
-                    "Event:",
-                    eventName
-                );
-
-
-                if (
-                    eventName !==
-                        "plugin_to_server" &&
-
-                    eventName !==
-                        "plugin_to_server_event" &&
-
-                    eventName !==
-                        "plugin_to_server_full" &&
-
-                    eventName !==
-                        "plugin_to_server_response"
-                ) {
-
-                    logJson(
-                        "Arguments:",
-                        args
-                    );
-                }
-
-            }
-        );
-
-    }
-);
+            pending.finish(503, {
+                success: false,
+                error: "Plugin disconnected",
+                requestId,
+                action: pending.action
+            });
+        }
+
+        plugins.delete(socket.id);
+    });
+});
 
 // ============================================================
 // CURRENT PLUGIN DATA — RAM ONLY
 // ============================================================
 
 app.get("/api/plugin/data", (req, res) => {
-
-    const plugins = Array.from(connectedPlugins.values());
-
-    const result = plugins.map(plugin => ({
+    const result = Array.from(plugins.values()).map((plugin) => ({
         pluginId: plugin.pluginId,
         pluginName: plugin.pluginName,
         departmentId: plugin.departmentId,
@@ -1335,62 +486,16 @@ app.get("/api/plugin/data", (req, res) => {
 // START SERVER
 // ============================================================
 
-httpServer.listen(
-    PORT,
-    "127.0.0.1",
-    () => {
-
-        console.log("");
-
-        console.log(
-            "================================="
-        );
-
-        console.log(
-            "ANARSYSTEM API"
-        );
-
-        console.log(
-            "================================="
-        );
-
-        console.log(
-            "Node.js:",
-            process.version
-        );
-
-        console.log(
-            "Port:",
-            PORT
-        );
-
-        console.log(
-            "HTTP: 127.0.0.1:" +
-            PORT
-        );
-
-        console.log(
-            "Socket.IO path:",
-            "/plugin-websocket/socket.io"
-        );
-
-        console.log(
-            "Socket.IO namespace:",
-            "/plugin-websocket"
-        );
-
-        console.log(
-            "Request API:",
-            "/api/plugin/request"
-        );
-
-        console.log(
-            "Server started"
-        );
-
-        console.log(
-            "================================="
-        );
-
-    }
-);
+httpServer.listen(PORT, "127.0.0.1", () => {
+    console.log("\n=================================");
+    console.log("ANARSYSTEM API");
+    console.log("=================================");
+    console.log("Node.js:", process.version);
+    console.log("Port:", PORT);
+    console.log("HTTP: 127.0.0.1:" + PORT);
+    console.log("Socket.IO path:", "/plugin-websocket/socket.io");
+    console.log("Socket.IO namespace:", "/plugin-websocket");
+    console.log("Request API:", "/api/plugin/request");
+    console.log("Server started");
+    console.log("=================================");
+});
