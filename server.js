@@ -15,10 +15,7 @@ app.use(express.json({ limit: "20mb" }));
 // HorecaControlPlugin connects to this Socket.IO namespace/path.
 const io = new Server(httpServer, {
     path: "/plugin-websocket/socket.io",
-    cors: {
-        origin: "*",
-        methods: ["GET", "POST"]
-    },
+    cors: { origin: "*", methods: ["GET", "POST"] },
     transports: ["polling", "websocket"],
     pingInterval: 25000,
     pingTimeout: 60000,
@@ -26,40 +23,22 @@ const io = new Server(httpServer, {
 });
 
 const pluginIO = io.of("/plugin-websocket");
-
-// socket.id -> plugin information
 const plugins = new Map();
-
-// requestId -> pending HTTP request
 const pendingRequests = new Map();
 
-function now() {
-    return new Date().toISOString();
-}
-
-function generateRequestId() {
-    return crypto.randomUUID();
-}
+function now() { return new Date().toISOString(); }
+function generateRequestId() { return crypto.randomUUID(); }
 
 function logJson(title, data) {
     console.log("\n" + title);
-    try {
-        console.log(JSON.stringify(data, null, 2));
-    } catch (error) {
-        console.log(String(data));
-    }
+    try { console.log(JSON.stringify(data, null, 2)); }
+    catch (error) { console.log(String(data)); }
 }
 
 function normalizeMessage(message) {
-    if (typeof message !== "string") {
-        return message;
-    }
-
-    try {
-        return JSON.parse(message);
-    } catch (error) {
-        return message;
-    }
+    if (typeof message !== "string") return message;
+    try { return JSON.parse(message); }
+    catch (error) { return message; }
 }
 
 function findPlugin(body) {
@@ -68,53 +47,35 @@ function findPlugin(body) {
     const requestedDepartmentId = body.departmentId || null;
     const requestedGroupId = body.groupId || null;
 
-    if (requestedSocketId) {
-        return plugins.get(requestedSocketId) || null;
-    }
-
+    if (requestedSocketId) return plugins.get(requestedSocketId) || null;
     if (requestedPluginId) {
         for (const plugin of plugins.values()) {
-            if (String(plugin.pluginId) === String(requestedPluginId)) {
-                return plugin;
-            }
+            if (String(plugin.pluginId) === String(requestedPluginId)) return plugin;
         }
     }
-
     if (requestedDepartmentId) {
         for (const plugin of plugins.values()) {
-            if (String(plugin.departmentId) === String(requestedDepartmentId)) {
-                return plugin;
-            }
+            if (String(plugin.departmentId) === String(requestedDepartmentId)) return plugin;
         }
     }
-
     if (requestedGroupId) {
         for (const plugin of plugins.values()) {
-            if (String(plugin.groupId) === String(requestedGroupId)) {
-                return plugin;
-            }
+            if (String(plugin.groupId) === String(requestedGroupId)) return plugin;
         }
     }
-
-    if (plugins.size === 1) {
-        return plugins.values().next().value;
-    }
-
+    if (plugins.size === 1) return plugins.values().next().value;
     return null;
 }
 
 // UI action -> EnumRequestType used by HorecaControlPlugin.
 const requestTypeByAction = {
     get_sales: "summaryOfRestaurant",
-    get_orders: "currentShiftOrdersList",
+    // Full report contains ordersDetails with waiter, cashier and payments.
+    get_orders: "getFullDataReport",
     get_payments: "summaryOfRestaurant",
     get_products: "topTenMealsByRevenue",
     get_employees: "revenueByWaiters"
 };
-
-// ============================================================
-// HEALTH
-// ============================================================
 
 app.get("/api/health", (req, res) => {
     res.json({
@@ -131,10 +92,6 @@ app.get("/api/health", (req, res) => {
     });
 });
 
-// ============================================================
-// IIKO CONNECT TEST
-// ============================================================
-
 app.post("/api/iiko/connect", (req, res) => {
     res.json({
         success: true,
@@ -147,13 +104,8 @@ app.post("/api/iiko/connect", (req, res) => {
     });
 });
 
-// ============================================================
-// PLUGIN STATUS
-// ============================================================
-
 app.get("/api/plugin/status", (req, res) => {
     const result = [];
-
     for (const [socketId, plugin] of plugins.entries()) {
         result.push({
             socketId,
@@ -171,31 +123,15 @@ app.get("/api/plugin/status", (req, res) => {
             lastResponseAt: plugin.lastResponseAt
         });
     }
-
-    res.json({
-        success: true,
-        count: result.length,
-        plugins: result
-    });
+    res.json({ success: true, count: result.length, plugins: result });
 });
-
-// ============================================================
-// SITE -> PLUGIN REQUEST
-// ============================================================
 
 app.post("/api/plugin/request", async (req, res) => {
     const body = req.body || {};
     const action = body.action;
-
-    if (!action) {
-        return res.status(400).json({
-            success: false,
-            error: "action is required"
-        });
-    }
+    if (!action) return res.status(400).json({ success: false, error: "action is required" });
 
     const requestType = requestTypeByAction[action];
-
     if (!requestType) {
         return res.status(400).json({
             success: false,
@@ -206,7 +142,6 @@ app.post("/api/plugin/request", async (req, res) => {
     }
 
     const plugin = findPlugin(body);
-
     if (!plugin) {
         return res.status(503).json({
             success: false,
@@ -216,9 +151,6 @@ app.post("/api/plugin/request", async (req, res) => {
     }
 
     const requestId = generateRequestId();
-
-    // IMPORTANT: HorecaControlPlugin listens for "server_to_plugin"
-    // and expects PluginEventData fields, especially requestType.
     const request = {
         chatId: "",
         requestId,
@@ -235,12 +167,8 @@ app.post("/api/plugin/request", async (req, res) => {
 
     return new Promise((resolve) => {
         let finished = false;
-
         const finish = (statusCode, payload) => {
-            if (finished) {
-                return;
-            }
-
+            if (finished) return;
             finished = true;
             clearTimeout(timer);
             pendingRequests.delete(requestId);
@@ -251,13 +179,7 @@ app.post("/api/plugin/request", async (req, res) => {
             console.log("\n========== PLUGIN REQUEST TIMEOUT ==========");
             console.log("Request ID:", requestId);
             console.log("Action:", action);
-
-            finish(504, {
-                success: false,
-                error: "Plugin request timeout",
-                requestId,
-                action
-            });
+            finish(504, { success: false, error: "Plugin request timeout", requestId, action });
         }, REQUEST_TIMEOUT_MS);
 
         pendingRequests.set(requestId, {
@@ -269,9 +191,7 @@ app.post("/api/plugin/request", async (req, res) => {
         });
 
         try {
-            // This is the event name used by HorecaControlPlugin.
             plugin.socket.emit("server_to_plugin", request);
-
             console.log("\n========== REQUEST SENT TO PLUGIN ==========");
             console.log("Socket:", plugin.socketId);
             console.log("Plugin ID:", plugin.pluginId);
@@ -289,14 +209,9 @@ app.post("/api/plugin/request", async (req, res) => {
     });
 });
 
-// ============================================================
-// SOCKET.IO CONNECTION
-// ============================================================
-
 pluginIO.on("connection", (socket) => {
     const query = socket.handshake.query || {};
     const auth = socket.handshake.auth || {};
-
     const plugin = {
         socket,
         socketId: socket.id,
@@ -331,17 +246,9 @@ pluginIO.on("connection", (socket) => {
     console.log("Server URL:", plugin.serverUrl);
     console.log("Time:", now());
 
-    // ========================================================
-    // PLUGIN -> SERVER
-    // ========================================================
-    // Plugin.SendMessage(...) emits "plugin_to_server".
-    // This is also where request/response messages arrive.
-
     socket.on("plugin_to_server", (rawMessage) => {
         const message = normalizeMessage(rawMessage);
-
         logJson("========== plugin_to_server ==========", message);
-
         plugin.lastResponseAt = now();
         plugin.lastEventAt = now();
 
@@ -357,17 +264,10 @@ pluginIO.on("connection", (socket) => {
             plugin.serverUrl = message.serverUrl || plugin.serverUrl;
         }
 
-        const requestId =
-            message && typeof message === "object"
-                ? message.requestId
-                : null;
-
-        if (!requestId) {
-            return;
-        }
+        const requestId = message && typeof message === "object" ? message.requestId : null;
+        if (!requestId) return;
 
         const pending = pendingRequests.get(requestId);
-
         if (!pending) {
             console.log("No pending request for:", requestId);
             return;
@@ -386,52 +286,23 @@ pluginIO.on("connection", (socket) => {
         });
     });
 
-    // ========================================================
-    // PLUGIN EVENT
-    // ========================================================
-
     socket.on("plugin_to_server_event", (event) => {
         logJson("========== plugin_to_server_event ==========", event);
-
         plugin.lastEventAt = now();
-
-        // Latest plugin packet is kept only in RAM.
         plugin.lastEvent = event;
     });
-
-    // ========================================================
-    // FULL DATA
-    // ========================================================
 
     socket.on("plugin_to_server_full", (data, callback) => {
         logJson("========== plugin_to_server_full ==========", data);
         plugin.lastEventAt = now();
-
-        if (typeof callback === "function") {
-            callback({
-                success: true,
-                receivedAt: now()
-            });
-        }
+        if (typeof callback === "function") callback({ success: true, receivedAt: now() });
     });
-
-    // ========================================================
-    // PING
-    // ========================================================
 
     socket.on("plugin_ping", (data, callback) => {
         if (typeof callback === "function") {
-            callback({
-                success: true,
-                serverTime: now(),
-                received: data || null
-            });
+            callback({ success: true, serverTime: now(), received: data || null });
         }
     });
-
-    // ========================================================
-    // DISCONNECT
-    // ========================================================
 
     socket.on("disconnect", (reason) => {
         console.log("\n=================================");
@@ -442,10 +313,7 @@ pluginIO.on("connection", (socket) => {
         console.log("Time:", now());
 
         for (const [requestId, pending] of pendingRequests.entries()) {
-            if (pending.pluginSocketId !== socket.id) {
-                continue;
-            }
-
+            if (pending.pluginSocketId !== socket.id) continue;
             pending.finish(503, {
                 success: false,
                 error: "Plugin disconnected",
@@ -453,14 +321,9 @@ pluginIO.on("connection", (socket) => {
                 action: pending.action
             });
         }
-
         plugins.delete(socket.id);
     });
 });
-
-// ============================================================
-// CURRENT PLUGIN DATA — RAM ONLY
-// ============================================================
 
 app.get("/api/plugin/data", (req, res) => {
     const result = Array.from(plugins.values()).map((plugin) => ({
@@ -475,16 +338,8 @@ app.get("/api/plugin/data", (req, res) => {
         data: plugin.lastEvent || null
     }));
 
-    res.json({
-        success: true,
-        count: result.length,
-        plugins: result
-    });
+    res.json({ success: true, count: result.length, plugins: result });
 });
-
-// ============================================================
-// START SERVER
-// ============================================================
 
 httpServer.listen(PORT, "127.0.0.1", () => {
     console.log("\n=================================");
