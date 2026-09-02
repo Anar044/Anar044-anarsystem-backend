@@ -17,47 +17,45 @@ jobs:
         run: |
           python3 - <<'PY'
           from pathlib import Path
-          import re
           p = Path('server.js')
           s = p.read_text()
-
-          old = '''function valueByNames(data, names) {
-    if (!data || typeof data !== "object") return null;
-    const wanted = names.map(x => String(x).toLowerCase());
-    for (const [key, value] of Object.entries(data)) {
-        if (wanted.includes(key.toLowerCase()) && value !== null && value !== undefined && value !== "") return value;
-    }
-    return null;
-}'''
-          new = '''function valueByNames(data, names, depth = 0) {
-    if (!data || typeof data !== "object" || depth > 12) return null;
-    const wanted = names.map(x => String(x).toLowerCase());
-    for (const [key, value] of Object.entries(data)) {
-        if (wanted.includes(key.toLowerCase()) && value !== null && value !== undefined && value !== "") return value;
-    }
-    for (const child of Object.values(data)) {
-        const found = valueByNames(child, names, depth + 1);
-        if (found !== null && found !== undefined && found !== "") return found;
-    }
-    return null;
-}'''
-          if old in s:
-              s = s.replace(old, new, 1)
-
-          replacements = {
-            r'(?m)^(\s*)tables: data\.tables \?\? data\.orderTables \?\? old\.tables \?\? null,$': r'\1tables: valueByNames(data, ["tables", "orderTables", "table", "tableName"]) ?? old.tables ?? null,',
-            r'(?m)^(\s*)floor: data\.floor \?\? data\.floorName \?\? old\.floor \?\? null,$': r'\1floor: valueByNames(data, ["floor", "floorName", "restaurantSection", "section", "hall"]) ?? old.floor ?? null,',
-            r'(?m)^(\s*)waiter: data\.waiter \?\? data\.waiterName \?\? old\.waiter \?\? null,$': r'\1waiter: valueByNames(data, ["waiter", "waiterName", "waiterFullName", "employee", "employeeName", "employeeFullName"]) ?? old.waiter ?? null,',
-            r'(?m)^(\s*)cashier: data\.cashier \?\? data\.cashierName \?\? old\.cashier \?\? null,$': r'\1cashier: valueByNames(data, ["cashier", "cashierName", "cashierFullName"]) ?? old.cashier ?? null,',
-            r'(?m)^(\s*)revenue: data\.revenue \?\? data\.resultSum \?\? data\.orderSum \?\? old\.revenue \?\? null,$': r'\1revenue: valueByNames(data, ["revenue", "resultSum", "orderSum", "sum", "total"]) ?? old.revenue ?? null,',
-            r'(?m)^(\s*)payments: data\.payments \?\? data\.payment \?\? data\.paymentType \?\? data\.paymentTypeName \?\? old\.payments \?\? null,$': r'\1payments: valueByNames(data, ["payments", "payment", "paymentType", "paymentTypeName", "paymentMethod", "paymentName"]) ?? old.payments ?? null,',
-            r'(?m)^(\s*)openTime: data\.openTime \?\? data\.orderOpenDate \?\? old\.openTime \?\? null,$': r'\1openTime: valueByNames(data, ["openTime", "orderOpenDate", "openedAt", "openingTime"]) ?? old.openTime ?? null,',
-            r'(?m)^(\s*)billTime: data\.billTime \?\? data\.orderBillTime \?\? old\.billTime \?\? null,$': r'\1billTime: valueByNames(data, ["billTime", "orderBillTime", "precheckTime", "precheckAt"]) ?? old.billTime ?? null,',
-            r'(?m)^(\s*)closeTime: data\.closeTime \?\? data\.orderCloseTime \?\? old\.closeTime \?\? null,$': r'\1closeTime: valueByNames(data, ["closeTime", "orderCloseTime", "closedAt", "closingTime"]) ?? old.closeTime ?? null,'
+          marker = '''function historicalOrderDetails(plugin, number) {'''
+          helper = '''function deepValueByNames(data, names, depth = 0) {
+              if (!data || typeof data !== "object" || depth > 12) return null;
+              const wanted = names.map(x => String(x).toLowerCase());
+              for (const [key, value] of Object.entries(data)) {
+                  if (wanted.includes(key.toLowerCase()) && value !== null && value !== undefined && value !== "") return value;
+              }
+              for (const child of Object.values(data)) {
+                  const found = deepValueByNames(child, names, depth + 1);
+                  if (found !== null && found !== undefined && found !== "") return found;
+              }
+              return null;
           }
-          for pattern, replacement in replacements.items():
-              s, _ = re.subn(pattern, replacement, s, count=1)
 
+          '''
+          if 'function deepValueByNames(' not in s:
+              s = s.replace(marker, helper + marker, 1)
+          start = s.index('function historicalOrderDetails(')
+          end = s.index('\nfunction mergeOrderEvent(', start)
+          block = s[start:end].replace('valueByNames(data, names)', 'deepValueByNames(data, names)')
+          s = s[:start] + block + s[end:]
+          start = s.index('function mergeOrderEvent(')
+          end = s.index('\nfunction restoreOrderDetails(', start)
+          block = s[start:end]
+          pairs = {
+              'data.tables ?? data.orderTables ?? old.tables ?? null': 'deepValueByNames(data, ["tables", "orderTables", "table", "tableName"]) ?? old.tables ?? null',
+              'data.floor ?? data.floorName ?? old.floor ?? null': 'deepValueByNames(data, ["floor", "floorName", "restaurantSection", "section", "hall"]) ?? old.floor ?? null',
+              'data.waiter ?? data.waiterName ?? old.waiter ?? null': 'deepValueByNames(data, ["waiter", "waiterName", "waiterFullName", "employee", "employeeName", "employeeFullName"]) ?? old.waiter ?? null',
+              'data.cashier ?? data.cashierName ?? old.cashier ?? null': 'deepValueByNames(data, ["cashier", "cashierName", "cashierFullName"]) ?? old.cashier ?? null',
+              'data.revenue ?? data.resultSum ?? data.orderSum ?? old.revenue ?? null': 'deepValueByNames(data, ["revenue", "resultSum", "orderSum", "sum", "total"]) ?? old.revenue ?? null',
+              'data.payments ?? data.payment ?? data.paymentType ?? data.paymentTypeName ?? old.payments ?? null': 'deepValueByNames(data, ["payments", "payment", "paymentType", "paymentTypeName", "paymentMethod", "paymentName"]) ?? old.payments ?? null',
+              'data.openTime ?? data.orderOpenDate ?? old.openTime ?? null': 'deepValueByNames(data, ["openTime", "orderOpenDate", "openedAt", "openingTime"]) ?? old.openTime ?? null',
+              'data.billTime ?? data.orderBillTime ?? old.billTime ?? null': 'deepValueByNames(data, ["billTime", "orderBillTime", "precheckTime", "precheckAt"]) ?? old.billTime ?? null',
+              'data.closeTime ?? data.orderCloseTime ?? old.closeTime ?? null': 'deepValueByNames(data, ["closeTime", "orderCloseTime", "closedAt", "closingTime"]) ?? old.closeTime ?? null'
+          }
+          for a,b in pairs.items(): block = block.replace(a,b)
+          s = s[:start] + block + s[end:]
           p.write_text(s)
           PY
       - name: Commit repair
@@ -65,10 +63,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add server.js
-          if ! git diff --cached --quiet; then
-            git commit -m "Fix nested order hall staff and payment fields"
-            git push
-          fi
+          if ! git diff --cached --quiet; then git commit -m "Fix nested order hall staff and payment fields"; git push; fi
       - name: Remove temporary workflow
         if: always()
         run: |
@@ -76,7 +71,4 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           rm -f .github/workflows/repair-order-fields.yml
           git add -A
-          if ! git diff --cached --quiet; then
-            git commit -m "Remove temporary repair workflow"
-            git push
-          fi
+          if ! git diff --cached --quiet; then git commit -m "Remove temporary repair workflow"; git push; fi
