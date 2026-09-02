@@ -128,8 +128,100 @@ function recordHistory(plugin, event) {
     saveHistory();
 }
 
-function enrichOrders(value, details) {
-    if (Array.isArray(value)) return value.map(x => enrichOrders(x, details));
+function firstScalar(value) {
+    if (value === null || value === undefined || value === "") return null;
+    if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") return value;
+    if (Array.isArray(value)) {
+        for (const item of value) {
+            const found = firstScalar(item);
+            if (found !== null) return found;
+        }
+        return null;
+    }
+    if (typeof value === "object") {
+        for (const key of ["name", "Name", "title", "Title", "productName", "ProductName", "itemName", "ItemName", "dishName", "DishName", "value", "Value"]) {
+            if (Object.prototype.hasOwnProperty.call(value, key)) {
+                const found = firstScalar(value[key]);
+                if (found !== null) return found;
+            }
+        }
+    }
+    return null;
+}
+
+function collectItemCandidates(value, out = [], depth = 0) {
+    if (depth > 8 || value === null || value === undefined) return out;
+    if (Array.isArray(value)) {
+        for (const item of value) collectItemCandidates(item, out, depth + 1);
+        return out;
+    }
+    if (typeof value !== "object") return out;
+
+    const name = firstScalar(value.itemName ?? value.ItemName ?? value.productName ?? value.ProductName ?? value.dishName ?? value.DishName ?? value.name ?? value.Name ?? value.title ?? value.Title);
+    const quantity = value.quantity ?? value.Quantity ?? value.amount ?? value.Amount ?? value.count ?? value.Count ?? value.itemAmount ?? value.ItemAmount;
+    const price = value.price ?? value.Price ?? value.unitPrice ?? value.UnitPrice;
+    const sum = value.sum ?? value.Sum ?? value.total ?? value.Total ?? value.revenue ?? value.Revenue ?? value.resultSum ?? value.ResultSum;
+
+    if (name !== null && (quantity !== undefined || price !== undefined || sum !== undefined || value.item || value.Item || value.product || value.Product)) {
+        out.push({ name, quantity, price, sum });
+    }
+
+    for (const [key, child] of Object.entries(value)) {
+        if (["orderNum", "OrderNum", "orderNumber", "OrderNumber"].includes(key)) continue;
+        collectItemCandidates(child, out, depth + 1);
+    }
+    return out;
+}
+
+function historyItems(plugin, number) {
+    const pk = String(plugin.pluginId || "unknown");
+    const list = historyStore[pk]?.[String(number)] || plugin.orderHistory.get(String(number)) || [];
+    const result = [];
+    const seen = new Set();
+
+    for (const entry of list) {
+        const type = String(entry.pluginEventType || "").toLowerCase();
+        const data = entry.data || {};
+        const candidates = [];
+
+        const directValues = [
+            data.item, data.Item, data.orderItem, data.OrderItem,
+            data.product, data.Product, data.menuItem, data.MenuItem,
+            data.items, data.Items, data.orderItems, data.OrderItems,
+            data.deletedItem, data.DeletedItem, data.addedItem, data.AddedItem
+        ];
+        for (const value of directValues) collectItemCandidates(value, candidates);
+        collectItemCandidates(data, candidates);
+
+        const isItemEvent = /(add|added|item|product|dish|delete|deletion|remove|removed|printed)/.test(type);
+        if (!isItemEvent && !candidates.length) continue;
+
+        for (const item of candidates) {
+            const name = String(item.name ?? "").trim();
+            if (!name) continue;
+            const qty = item.quantity === undefined || item.quantity === null || item.quantity === "" ? 1 : item.quantity;
+            const key = `${entry.uuid || entry.receivedAt}|${name}|${qty}|${item.sum ?? ""}`;
+            if (seen.has(key)) continue;
+            seen.add(key);
+
+            const deleted = /(delete|deletion|remove|removed|storno|void|cancel)/.test(type);
+            result.push({
+                name,
+                quantity: qty,
+                price: item.price ?? null,
+                sum: item.sum ?? null,
+                status: deleted ? "Удалено" : "Добавлено",
+                eventType: entry.pluginEventType || null,
+                eventAt: entry.receivedAt
+            });
+        }
+    }
+
+    return result;
+}
+
+function enrichOrders(value, details, plugin) {
+    if (Array.isArray(value)) return value.map(x => enrichOrders(x, details, plugin));
     if (!value || typeof value !== "object") return value;
 
     const result = { ...value };
@@ -146,8 +238,14 @@ function enrichOrders(value, details) {
             if (result.billTime == null && result.BillTime == null && result.orderBillTime == null && result.OrderBillTime == null) result.billTime = extra.billTime;
             if (result.closeTime == null && result.CloseTime == null && result.orderCloseTime == null && result.OrderCloseTime == null) result.closeTime = extra.closeTime;
         }
+
+        const hasItems = ["items", "Items", "orderItems", "OrderItems", "products", "Products"].some(key => Array.isArray(result[key]) && result[key].length);
+        if (!hasItems && plugin) {
+            const reconstructed = historyItems(plugin, number);
+            if (reconstructed.length) result.items = reconstructed;
+        }
     }
-    for (const [key, child] of Object.entries(result)) result[key] = enrichOrders(child, details);
+    for (const [key, child] of Object.entries(result)) result[key] = enrichOrders(child, details, plugin);
     return result;
 }
 
@@ -249,7 +347,8 @@ app.get("/api/plugin/order-history", (req, res) => {
 
     const pk = String(plugin.pluginId || "unknown");
     const history = historyStore[pk]?.[String(number)] || plugin.orderHistory.get(String(number)) || [];
-    res.json({ success: true, pluginId: plugin.pluginId, orderNum: String(number), count: history.length, history });
+    const items = historyItems(plugin, number);
+    res.json({ success: true, pluginId: plugin.pluginId, orderNum: String(number), count: history.length, history, items });
 });
 
 pluginIO.on("connection", socket => {
@@ -304,7 +403,7 @@ pluginIO.on("connection", socket => {
         if (!pending) return;
 
         let data = message.data !== undefined ? message.data : null;
-        if (pending.action === "get_orders" && data) data = enrichOrders(data, plugin.orderDetails);
+        if (pending.action === "get_orders" && data) data = enrichOrders(data, plugin.orderDetails, plugin);
 
         pending.finish(200, {
             success: message.success !== false,
