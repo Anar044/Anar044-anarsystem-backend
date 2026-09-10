@@ -94,20 +94,13 @@ function requestedDepartmentIds(body = {}) {
 
 function pluginMatchesBinding(plugin, body = {}) {
     const departmentIds = requestedDepartmentIds(body);
-    const requestedServer = canonicalServerUrl(body.serverUrl || body.iikoServerUrl || "");
-    if (departmentIds.length) {
-        if (!plugin.departmentId) return false;
-        if (!departmentIds.some(id => String(plugin.departmentId) === id)) return false;
-    }
-    if (requestedServer) {
-        if (!plugin.serverUrl) return false;
-        if (canonicalServerUrl(plugin.serverUrl) !== requestedServer) return false;
-    }
-    return true;
+    if (!departmentIds.length) return false;
+    if (!plugin.departmentId) return false;
+    return departmentIds.some(id => String(plugin.departmentId) === id);
 }
 
 function findPlugin(body = {}) {
-    const hasBinding = requestedDepartmentIds(body).length > 0 || Boolean(body.serverUrl || body.iikoServerUrl);
+    const hasBinding = requestedDepartmentIds(body).length > 0;
     if (body.socketId && plugins.has(body.socketId)) {
         const plugin = plugins.get(body.socketId);
         return !hasBinding || pluginMatchesBinding(plugin, body) ? plugin : null;
@@ -423,7 +416,7 @@ pluginIO.on("connection", socket => {
 });
 
 app.get("/api/plugin/data", (req, res) => {
-    const hasBinding = requestedDepartmentIds(req.query || {}).length > 0 || Boolean(req.query?.serverUrl || req.query?.iikoServerUrl);
+    const hasBinding = requestedDepartmentIds(req.query || {}).length > 0;
     const visible = hasBinding ? Array.from(plugins.values()).filter(plugin => pluginMatchesBinding(plugin, req.query || {})) : Array.from(plugins.values());
     res.json({
         success: true,
