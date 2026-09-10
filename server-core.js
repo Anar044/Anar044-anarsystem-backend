@@ -27,6 +27,7 @@ const io = new Server(httpServer, {
 
 const pluginIO = io.of("/plugin-websocket");
 const plugins = new Map();
+const pluginRegistry = new Map();
 const pendingRequests = new Map();
 
 let historyStore = {};
@@ -353,6 +354,7 @@ pluginIO.on("connection", socket => {
     const plugin = {
         socket,
         socketId: socket.id,
+        online: true,
         pluginId: q.pluginId || a.pluginId || null,
         pluginName: q.pluginName || a.pluginName || null,
         departmentId: q.departmentId || a.departmentId || null,
@@ -373,6 +375,9 @@ pluginIO.on("connection", socket => {
     if (saved) for (const [key, list] of Object.entries(saved)) if (Array.isArray(list)) plugin.orderHistory.set(key, list);
     restoreOrderDetails(plugin, saved);
     plugins.set(socket.id, plugin);
+    if (plugin.pluginId) {
+        pluginRegistry.set(String(plugin.pluginId), { pluginId: plugin.pluginId, pluginName: plugin.pluginName, departmentId: plugin.departmentId, departmentName: plugin.departmentName, groupId: plugin.groupId, groupName: plugin.groupName, version: plugin.version, currencyCode: plugin.currencyCode, lastEventAt: plugin.lastEventAt, connectedAt: plugin.connectedAt, disconnectedAt: null, online: true });
+    }
     console.log("PLUGIN CONNECTED", socket.id, plugin.pluginId, plugin.pluginName);
 
     socket.on("plugin_to_server", raw => {
@@ -389,6 +394,9 @@ pluginIO.on("connection", socket => {
             plugin.version = message.version || plugin.version;
             plugin.currencyCode = message.currencyCode || plugin.currencyCode;
             plugin.serverUrl = message.serverUrl || plugin.serverUrl;
+            if (plugin.pluginId) {
+                pluginRegistry.set(String(plugin.pluginId), { ...(pluginRegistry.get(String(plugin.pluginId)) || {}), pluginId: plugin.pluginId, pluginName: plugin.pluginName, departmentId: plugin.departmentId, departmentName: plugin.departmentName, groupId: plugin.groupId, groupName: plugin.groupName, version: plugin.version, currencyCode: plugin.currencyCode, lastEventAt: plugin.lastEventAt, connectedAt: plugin.connectedAt, disconnectedAt: null, online: true });
+            }
         }
         const id = message?.requestId || message?.data?.requestId || message?.result?.requestId;
         if (!id) return;
@@ -411,29 +419,25 @@ pluginIO.on("connection", socket => {
         for (const pending of pendingRequests.values()) {
             if (pending.pluginSocketId === socket.id) pending.finish(503, { success: false, error: "Plugin disconnected", requestId: pending.requestId, action: pending.action });
         }
+        if (plugin.pluginId) {
+            pluginRegistry.set(String(plugin.pluginId), { ...(pluginRegistry.get(String(plugin.pluginId)) || {}), pluginId: plugin.pluginId, pluginName: plugin.pluginName, departmentId: plugin.departmentId, departmentName: plugin.departmentName, groupId: plugin.groupId, groupName: plugin.groupName, version: plugin.version, currencyCode: plugin.currencyCode, lastEventAt: plugin.lastEventAt, connectedAt: plugin.connectedAt, disconnectedAt: now(), online: false });
+        }
         plugins.delete(socket.id);
     });
 });
 
 app.get("/api/plugin/data", (req, res) => {
     const hasBinding = requestedDepartmentIds(req.query || {}).length > 0;
-    const visible = hasBinding ? Array.from(plugins.values()).filter(plugin => pluginMatchesBinding(plugin, req.query || {})) : Array.from(plugins.values());
-    res.json({
-        success: true,
-        count: visible.length,
-        plugins: visible.map(p => ({
-            pluginId: p.pluginId,
-            pluginName: p.pluginName,
-            departmentId: p.departmentId,
-            departmentName: p.departmentName,
-            groupId: p.groupId,
-            groupName: p.groupName,
-            version: p.version,
-            serverUrl: p.serverUrl,
-            lastEventAt: p.lastEventAt,
-            data: p.lastEvent || null
-        }))
-    });
+    const source = Array.from(pluginRegistry.values());
+    const visible = hasBinding ? source.filter(plugin => pluginMatchesBinding(plugin, req.query || {})) : source;
+    const pluginsOut = visible.map(p => ({ pluginId: p.pluginId, pluginName: p.pluginName, departmentId: p.departmentId, departmentName: p.departmentName, groupId: p.groupId, groupName: p.groupName, version: p.version, currencyCode: p.currencyCode, lastEventAt: p.lastEventAt || null, connectedAt: p.connectedAt || null, disconnectedAt: p.disconnectedAt || null, online: p.online === true }));
+    const groupsMap = new Map();
+    for (const p of pluginsOut) {
+        const key = String(p.groupId || p.groupName || "unknown");
+        if (!groupsMap.has(key)) groupsMap.set(key, { groupId: p.groupId || null, groupName: p.groupName || "Без группы", departmentId: p.departmentId || null, departmentName: p.departmentName || null, cashRegisters: [] });
+        groupsMap.get(key).cashRegisters.push(p);
+    }
+    res.json({ success: true, count: pluginsOut.length, plugins: pluginsOut, groups: Array.from(groupsMap.values()) });
 });
 
 httpServer.listen(PORT, "127.0.0.1", () => {
