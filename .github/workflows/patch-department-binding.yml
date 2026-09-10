@@ -1,0 +1,60 @@
+name: Patch Department ID binding
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Patch only plugin ownership logic
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          p = Path('server-core.js')
+          text = p.read_text(encoding='utf-8')
+
+          pattern = r'function pluginMatchesBinding\(plugin, body = \{\}\) \{.*?\n\}\n\nfunction findPlugin'
+          replacement = '''function pluginMatchesBinding(plugin, body = {}) {
+              const departmentIds = requestedDepartmentIds(body);
+              if (!departmentIds.length) return false;
+              if (!plugin.departmentId) return false;
+              return departmentIds.some(id => String(plugin.departmentId) === id);
+          }
+
+          function findPlugin'''
+          text, count = re.subn(pattern, replacement, text, count=1, flags=re.S)
+          if count != 1:
+              raise SystemExit(f'pluginMatchesBinding replacement count: {count}')
+
+          old = 'requestedDepartmentIds(body).length > 0 || Boolean(body.serverUrl || body.iikoServerUrl)'
+          if text.count(old) != 1:
+              raise SystemExit(f'findPlugin binding expression count: {text.count(old)}')
+          text = text.replace(old, 'requestedDepartmentIds(body).length > 0')
+
+          old = 'requestedDepartmentIds(req.query || {}).length > 0 || Boolean(req.query?.serverUrl || req.query?.iikoServerUrl)'
+          if text.count(old) != 1:
+              raise SystemExit(f'/api/plugin/data binding expression count: {text.count(old)}')
+          text = text.replace(old, 'requestedDepartmentIds(req.query || {}).length > 0')
+
+          p.write_text(text, encoding='utf-8')
+          print('Backend Department ID binding patch applied.')
+          PY
+
+      - name: Commit patch
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add server-core.js
+          git commit -m "fix: bind plugins by Department ID only" || exit 0
+          git push
