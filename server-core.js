@@ -242,7 +242,7 @@ function firstScalar(value) {
         for (const item of value) { const found = firstScalar(item); if (found !== null) return found; }
         return null;
     }
-    if (typeof value === "object') return null;
+    if (typeof value !== "object") return null;
     if (typeof value === "object") {
         for (const key of ["name", "Name", "title", "Title", "productName", "ProductName", "itemName", "ItemName", "dishName", "DishName", "value", "Value"]) {
             if (Object.prototype.hasOwnProperty.call(value, key)) { const found = firstScalar(value[key]); if (found !== null) return found; }
