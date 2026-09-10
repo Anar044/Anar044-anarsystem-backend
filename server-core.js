@@ -72,14 +72,66 @@ const requestTypeByAction = {
     get_employees: "revenueByWaiters"
 };
 
+function canonicalServerUrl(value) {
+    let text = String(value || "").trim();
+    if (!text) return "";
+    text = text.replace(/\/+$/, "");
+    if (!/^https?:\/\//i.test(text)) text = `http://${text}`;
+    try {
+        const url = new URL(text);
+        return `${url.protocol.toLowerCase()}//${url.host.toLowerCase()}`;
+    } catch (_) {
+        return text.toLowerCase();
+    }
+}
+
+function requestedDepartmentIds(body = {}) {
+    const raw = body.departmentIds ?? body.departmentId ?? body.departments;
+    if (Array.isArray(raw)) return raw.map(String).map(x => x.trim()).filter(Boolean);
+    if (raw == null || raw === "") return [];
+    return String(raw).split(",").map(x => x.trim()).filter(Boolean);
+}
+
+function pluginMatchesBinding(plugin, body = {}) {
+    const departmentIds = requestedDepartmentIds(body);
+    const requestedServer = canonicalServerUrl(body.serverUrl || body.iikoServerUrl || "");
+
+    if (departmentIds.length) {
+        if (!plugin.departmentId) return false;
+        if (!departmentIds.some(id => String(plugin.departmentId) === id)) return false;
+    }
+
+    if (requestedServer) {
+        if (!plugin.serverUrl) return false;
+        if (canonicalServerUrl(plugin.serverUrl) !== requestedServer) return false;
+    }
+
+    return true;
+}
+
 function findPlugin(body = {}) {
-    if (body.socketId && plugins.has(body.socketId)) return plugins.get(body.socketId);
+    const hasBinding = requestedDepartmentIds(body).length > 0 || Boolean(body.serverUrl || body.iikoServerUrl);
+
+    if (body.socketId && plugins.has(body.socketId)) {
+        const plugin = plugins.get(body.socketId);
+        return !hasBinding || pluginMatchesBinding(plugin, body) ? plugin : null;
+    }
+
     for (const plugin of plugins.values()) {
-        if (body.pluginId && String(plugin.pluginId) === String(body.pluginId)) return plugin;
+        if (body.pluginId && String(plugin.pluginId) === String(body.pluginId)) {
+            if (!hasBinding || pluginMatchesBinding(plugin, body)) return plugin;
+            return null;
+        }
+    }
+
+    for (const plugin of plugins.values()) {
+        if (hasBinding && !pluginMatchesBinding(plugin, body)) continue;
         if (body.departmentId && String(plugin.departmentId) === String(body.departmentId)) return plugin;
         if (body.groupId && String(plugin.groupId) === String(body.groupId)) return plugin;
     }
-    return plugins.size === 1 ? plugins.values().next().value : null;
+
+    if (!hasBinding && plugins.size === 1) return plugins.values().next().value;
+    return null;
 }
 
 function orderNumber(data) {
@@ -107,39 +159,6 @@ function deepValueByNames(data, names, depth = 0) {
         if (found !== null && found !== undefined && found !== "") return found;
     }
     return null;
-}
-
-function historicalOrderDetails(plugin, number) {
-    const pk = String(plugin.pluginId || "unknown");
-    const list = historyStore[pk]?.[String(number)] || plugin.orderHistory.get(String(number)) || [];
-    if (!Array.isArray(list) || !list.length) return null;
-
-    const result = {};
-    const fields = {
-        tables: ["tables", "orderTables", "table", "tableName"],
-        floor: ["floor", "floorName", "restaurantSection"],
-        waiter: ["waiter", "waiterName", "waiterFullName"],
-        cashier: ["cashier", "cashierName", "cashierFullName"],
-        revenue: ["revenue", "resultSum", "orderSum", "sum", "total"],
-        openTime: ["openTime", "orderOpenDate", "openedAt", "openingTime"],
-        billTime: ["billTime", "orderBillTime", "precheckTime", "precheckAt"],
-        closeTime: ["closeTime", "orderCloseTime", "closedAt", "closingTime"],
-        payments: ["payments", "payment", "paymentType", "paymentTypeName", "paymentMethod", "paymentName"]
-    };
-
-    for (let i = list.length - 1; i >= 0; i--) {
-        const data = list[i]?.data;
-        if (!data || typeof data !== "object") continue;
-        for (const [target, names] of Object.entries(fields)) {
-            if (result[target] == null) {
-                const value = deepValueByNames(data, names);
-                if (value != null) result[target] = value;
-            }
-        }
-        if (Object.keys(result).length === Object.keys(fields).length) break;
-    }
-
-    return Object.keys(result).length ? result : null;
 }
 
 function mergeOrderEvent(plugin, event) {
@@ -171,10 +190,7 @@ function restoreOrderDetails(plugin, saved) {
         if (!Array.isArray(list)) continue;
         for (const entry of list) {
             if (!entry || !entry.data) continue;
-            mergeOrderEvent(plugin, {
-                pluginEventType: entry.pluginEventType || null,
-                data: entry.data
-            });
+            mergeOrderEvent(plugin, { pluginEventType: entry.pluginEventType || null, data: entry.data });
         }
     }
 }
@@ -183,22 +199,14 @@ function recordHistory(plugin, event) {
     const data = event?.data;
     const number = orderNumber(data);
     if (number === null || number === undefined || number === "") return;
-
     const pk = String(plugin.pluginId || "unknown");
     const ok = String(number);
     if (!historyStore[pk] || typeof historyStore[pk] !== "object") historyStore[pk] = {};
     if (!Array.isArray(historyStore[pk][ok])) historyStore[pk][ok] = [];
-
     const list = historyStore[pk][ok];
     const uuid = event.uuid || null;
     if (uuid && list.some(x => x.uuid === uuid)) return;
-
-    list.push({
-        uuid,
-        pluginEventType: event.pluginEventType || null,
-        receivedAt: now(),
-        data
-    });
+    list.push({ uuid, pluginEventType: event.pluginEventType || null, receivedAt: now(), data });
     if (list.length > MAX_EVENTS_PER_ORDER) list.splice(0, list.length - MAX_EVENTS_PER_ORDER);
     plugin.orderHistory.set(ok, list);
     saveHistory();
@@ -208,18 +216,12 @@ function firstScalar(value) {
     if (value === null || value === undefined || value === "") return null;
     if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") return value;
     if (Array.isArray(value)) {
-        for (const item of value) {
-            const found = firstScalar(item);
-            if (found !== null) return found;
-        }
+        for (const item of value) { const found = firstScalar(item); if (found !== null) return found; }
         return null;
     }
     if (typeof value === "object") {
         for (const key of ["name", "Name", "title", "Title", "productName", "ProductName", "itemName", "ItemName", "dishName", "DishName", "value", "Value"]) {
-            if (Object.prototype.hasOwnProperty.call(value, key)) {
-                const found = firstScalar(value[key]);
-                if (found !== null) return found;
-            }
+            if (Object.prototype.hasOwnProperty.call(value, key)) { const found = firstScalar(value[key]); if (found !== null) return found; }
         }
     }
     return null;
@@ -227,21 +229,13 @@ function firstScalar(value) {
 
 function collectItemCandidates(value, out = [], depth = 0) {
     if (depth > 8 || value === null || value === undefined) return out;
-    if (Array.isArray(value)) {
-        for (const item of value) collectItemCandidates(item, out, depth + 1);
-        return out;
-    }
+    if (Array.isArray(value)) { for (const item of value) collectItemCandidates(item, out, depth + 1); return out; }
     if (typeof value !== "object") return out;
-
     const name = firstScalar(value.itemName ?? value.ItemName ?? value.productName ?? value.ProductName ?? value.dishName ?? value.DishName ?? value.name ?? value.Name ?? value.title ?? value.Title);
     const quantity = value.quantity ?? value.Quantity ?? value.amount ?? value.Amount ?? value.count ?? value.Count ?? value.itemAmount ?? value.ItemAmount;
     const price = value.price ?? value.Price ?? value.unitPrice ?? value.UnitPrice;
     const sum = value.sum ?? value.Sum ?? value.total ?? value.Total ?? value.revenue ?? value.Revenue ?? value.resultSum ?? value.ResultSum;
-
-    if (name !== null && (quantity !== undefined || price !== undefined || sum !== undefined || value.item || value.Item || value.product || value.Product)) {
-        out.push({ name, quantity, price, sum });
-    }
-
+    if (name !== null && (quantity !== undefined || price !== undefined || sum !== undefined || value.item || value.Item || value.product || value.Product)) out.push({ name, quantity, price, sum });
     for (const [key, child] of Object.entries(value)) {
         if (["orderNum", "OrderNum", "orderNumber", "OrderNumber"].includes(key)) continue;
         collectItemCandidates(child, out, depth + 1);
@@ -254,172 +248,65 @@ function historyItems(plugin, number) {
     const list = historyStore[pk]?.[String(number)] || plugin.orderHistory.get(String(number)) || [];
     const result = [];
     const seen = new Set();
-
     for (const entry of list) {
         const type = String(entry.pluginEventType || "").toLowerCase();
         const data = entry.data || {};
-        const candidates = [];
-
-        const directValues = [
-            data.item, data.Item, data.orderItem, data.OrderItem,
-            data.product, data.Product, data.menuItem, data.MenuItem,
-            data.items, data.Items, data.orderItems, data.OrderItems,
-            data.deletedItem, data.DeletedItem, data.addedItem, data.AddedItem
-        ];
-        for (const value of directValues) collectItemCandidates(value, candidates);
-        collectItemCandidates(data, candidates);
-
-        const isItemEvent = /(add|added|item|product|dish|delete|deletion|remove|removed|printed)/.test(type);
-        if (!isItemEvent && !candidates.length) continue;
-
-        for (const item of candidates) {
-            const name = String(item.name ?? "").trim();
-            if (!name) continue;
-            const qty = item.quantity === undefined || item.quantity === null || item.quantity === "" ? 1 : item.quantity;
-            const key = `${entry.uuid || entry.receivedAt}|${name}|${qty}|${item.sum ?? ""}`;
-            if (seen.has(key)) continue;
-            seen.add(key);
-
-            const deleted = /(delete|deletion|remove|removed|storno|void|cancel)/.test(type);
-            result.push({
-                name,
-                quantity: qty,
-                price: item.price ?? null,
-                sum: item.sum ?? null,
-                status: deleted ? "Удалено" : "Добавлено",
-                eventType: entry.pluginEventType || null,
-                eventAt: entry.receivedAt
-            });
+        if (/discount|surcharge|delete|remove|item|dish/.test(type)) {
+            for (const item of collectItemCandidates(data)) {
+                const key = JSON.stringify(item);
+                if (!seen.has(key)) { seen.add(key); result.push(item); }
+            }
         }
     }
-
     return result;
 }
 
-function enrichOrders(value, details, plugin) {
-    if (Array.isArray(value)) return value.map(x => enrichOrders(x, details, plugin));
-    if (!value || typeof value !== "object") return value;
-
-    const result = { ...value };
-    const number = orderNumber(result);
-    if (number !== null && number !== undefined && number !== "") {
-        const extra = details.get(String(number)) || historicalOrderDetails(plugin, number);
-        if (extra) {
-            if (result.waiter == null && result.Waiter == null) result.waiter = extra.waiter;
-            if (result.cashier == null && result.Cashier == null) result.cashier = extra.cashier;
-            if (result.floor == null && result.Floor == null) result.floor = extra.floor;
-            if (result.tables == null && result.Tables == null && result.orderTables == null && result.OrderTables == null) result.tables = extra.tables;
-            if (result.revenue == null && result.Revenue == null && result.orderExpectedRevenue == null && result.OrderExpectedRevenue == null) result.revenue = extra.revenue;
-            if (result.payments == null && result.Payments == null) result.payments = extra.payments;
-            if (result.paymentType == null && result.PaymentType == null && typeof extra.payments === "string") result.paymentType = extra.payments;
-            if (result.openTime == null && result.OpenTime == null && result.orderOpenDate == null && result.OrderOpenDate == null) result.openTime = extra.openTime;
-            if (result.billTime == null && result.BillTime == null && result.orderBillTime == null && result.OrderBillTime == null) result.billTime = extra.billTime;
-            if (result.closeTime == null && result.CloseTime == null && result.orderCloseTime == null && result.OrderCloseTime == null) result.closeTime = extra.closeTime;
-        }
-
-        const hasItems = ["items", "Items", "orderItems", "OrderItems", "products", "Products"].some(key => Array.isArray(result[key]) && result[key].length);
-        if (!hasItems && plugin) {
-            const reconstructed = historyItems(plugin, number);
-            if (reconstructed.length) result.items = reconstructed;
+function enrichOrders(data, orderDetails) {
+    const root = normalize(data);
+    if (!root || typeof root !== "object") return root;
+    const copy = JSON.parse(JSON.stringify(root));
+    const groups = Array.isArray(copy?.terminalsGroups) ? copy.terminalsGroups : [];
+    for (const group of groups) {
+        for (const section of (Array.isArray(group?.restaurantSections) ? group.restaurantSections : [])) {
+            for (const key of ["orders", "deliveries"]) {
+                if (!Array.isArray(section[key])) continue;
+                section[key] = section[key].map(order => {
+                    const number = orderNumber(order);
+                    if (number == null) return order;
+                    const details = orderDetails.get(String(number));
+                    return details ? { ...order, ...details } : order;
+                });
+            }
+            if (Array.isArray(section.reserves)) {
+                section.reserves = section.reserves.map(reserve => {
+                    const order = reserve?.reserveOrder;
+                    const number = orderNumber(order);
+                    if (number == null) return reserve;
+                    const details = orderDetails.get(String(number));
+                    return details ? { ...reserve, reserveOrder: { ...order, ...details } } : reserve;
+                });
+            }
         }
     }
-    for (const [key, child] of Object.entries(result)) result[key] = enrichOrders(child, details, plugin);
-    return result;
+    return copy;
 }
 
-app.get("/api/health", (req, res) => res.json({
-    success: true,
-    service: "AnarSystem API",
-    server: "Oracle VPS",
-    node: process.version,
-    time: now(),
-    socketIo: true,
-    socketIoPath: "/plugin-websocket/socket.io",
-    socketIoNamespace: "/plugin-websocket",
-    connectedPlugins: plugins.size,
-    pendingRequests: pendingRequests.size
-}));
+app.get("/health", (req, res) => res.json({ success: true, service: "anarsystem-backend", plugins: plugins.size }));
 
-app.post("/api/iiko/connect", (req, res) => res.json({
-    success: true,
-    message: "AnarSystem API работает",
-    received: { ip: req.body.ip || null, port: req.body.port || null, login: req.body.login || null }
-}));
-
-app.get("/api/plugin/status", (req, res) => {
-    res.json({
-        success: true,
-        count: plugins.size,
-        plugins: Array.from(plugins.values()).map(p => ({
-            socketId: p.socketId,
-            pluginId: p.pluginId,
-            pluginName: p.pluginName,
-            departmentId: p.departmentId,
-            departmentName: p.departmentName,
-            groupId: p.groupId,
-            groupName: p.groupName,
-            version: p.version,
-            currencyCode: p.currencyCode,
-            serverUrl: p.serverUrl,
-            connectedAt: p.connectedAt,
-            lastEventAt: p.lastEventAt,
-            lastResponseAt: p.lastResponseAt
-        }))
-    });
-});
-
-app.post("/api/plugin/request", (req, res) => {
+app.post("/api/plugin/request", async (req, res) => {
     const body = req.body || {};
     const action = body.action;
-    const type = requestTypeByAction[action];
-    if (!action || !type) return res.status(400).json({ success: false, error: "Unsupported plugin action", action });
-
+    if (!action) return res.status(400).json({ success: false, error: "action is required" });
     const plugin = findPlugin(body);
-    if (!plugin) return res.status(503).json({ success: false, error: "No connected plugin found", connectedPlugins: plugins.size });
-
+    if (!plugin) return res.status(503).json({ success: false, error: "No connected plugin found for the requested iiko Server / Department", connectedPlugins: plugins.size });
     const id = requestId();
-    let requestDetail = JSON.stringify(body.params || {});
-    if (action === "get_order") {
-        const number = body.params?.orderNum ?? body.params?.orderNumber ?? body.orderNum ?? body.orderNumber;
-        requestDetail = String(number ?? "");
-    }
-
-    const request = {
-        chatId: "",
-        requestId: id,
-        requestType: type,
-        requestDetail
-    };
-
-    return new Promise(resolve => {
-        let done = false;
-        const finish = (status, payload) => {
-            if (done) return;
-            done = true;
-            clearTimeout(timer);
-            pendingRequests.delete(id);
-            resolve(res.status(status).json(payload));
-        };
-        const timer = setTimeout(() => finish(504, {
-            success: false,
-            error: "Plugin request timeout",
-            requestId: id,
-            action
-        }), REQUEST_TIMEOUT_MS);
-
-        pendingRequests.set(id, {
-            requestId: id,
-            action,
-            pluginSocketId: plugin.socketId,
-            createdAt: now(),
-            finish
-        });
-
-        try {
-            plugin.socket.emit("server_to_plugin", request);
-        } catch (e) {
-            finish(500, { success: false, error: e.message, requestId: id, action });
-        }
+    const request = { ...body, requestId: id, requestType: body.requestType || requestTypeByAction[action] || action };
+    await new Promise(resolve => {
+        const finish = (status, payload) => { clearTimeout(timer); pendingRequests.delete(id); resolve(res.status(status).json(payload)); };
+        const timer = setTimeout(() => finish(504, { success: false, error: "Plugin request timeout", requestId: id, action }), REQUEST_TIMEOUT_MS);
+        pendingRequests.set(id, { requestId: id, action, pluginSocketId: plugin.socketId, createdAt: now(), finish });
+        try { plugin.socket.emit("server_to_plugin", request); }
+        catch (e) { finish(500, { success: false, error: e.message, requestId: id, action }); }
     });
 });
 
@@ -427,8 +314,7 @@ app.get("/api/plugin/order-history", (req, res) => {
     const number = req.query.orderNum;
     if (number === undefined || number === null || number === "") return res.status(400).json({ success: false, error: "orderNum is required" });
     const plugin = findPlugin(req.query);
-    if (!plugin) return res.status(503).json({ success: false, error: "No connected plugin found", connectedPlugins: plugins.size });
-
+    if (!plugin) return res.status(503).json({ success: false, error: "No connected plugin found for the requested iiko Server / Department", connectedPlugins: plugins.size });
     const pk = String(plugin.pluginId || "unknown");
     const history = historyStore[pk]?.[String(number)] || plugin.orderHistory.get(String(number)) || [];
     const items = historyItems(plugin, number);
@@ -449,7 +335,7 @@ pluginIO.on("connection", socket => {
         groupName: q.groupName || a.groupName || null,
         version: q.version || a.version || null,
         currencyCode: q.currencyCode || a.currencyCode || null,
-        serverUrl: a.serverUrl || null,
+        serverUrl: a.serverUrl || q.serverUrl || null,
         connectedAt: now(),
         lastEventAt: null,
         lastResponseAt: null,
@@ -457,19 +343,16 @@ pluginIO.on("connection", socket => {
         orderDetails: new Map(),
         orderHistory: new Map()
     };
-
     const saved = historyStore[String(plugin.pluginId || "unknown")];
     if (saved) for (const [key, list] of Object.entries(saved)) if (Array.isArray(list)) plugin.orderHistory.set(key, list);
     restoreOrderDetails(plugin, saved);
-
     plugins.set(socket.id, plugin);
-    console.log("PLUGIN CONNECTED", socket.id, plugin.pluginId, plugin.pluginName);
+    console.log("PLUGIN CONNECTED", socket.id, plugin.pluginId, plugin.pluginName, plugin.departmentId, plugin.serverUrl);
 
     socket.on("plugin_to_server", raw => {
         const message = normalizeMessage(raw);
         plugin.lastResponseAt = now();
         plugin.lastEventAt = now();
-
         if (message && typeof message === "object") {
             plugin.pluginId = message.pluginId || plugin.pluginId;
             plugin.pluginName = message.pluginName || plugin.pluginName;
@@ -481,22 +364,13 @@ pluginIO.on("connection", socket => {
             plugin.currencyCode = message.currencyCode || plugin.currencyCode;
             plugin.serverUrl = message.serverUrl || plugin.serverUrl;
         }
-
         const id = message?.requestId || message?.data?.requestId || message?.result?.requestId;
         if (!id) return;
         const pending = pendingRequests.get(id);
         if (!pending) return;
-
         let data = message.data !== undefined ? message.data : null;
-        if (pending.action === "get_orders" && data) data = enrichOrders(data, plugin.orderDetails, plugin);
-
-        pending.finish(200, {
-            success: message.success !== false,
-            requestId: id,
-            action: pending.action,
-            data,
-            error: message.error || null
-        });
+        if (pending.action === "get_orders" && data) data = enrichOrders(data, plugin.orderDetails);
+        pending.finish(200, { success: message.success !== false, requestId: id, action: pending.action, data, error: message.error || null });
     });
 
     socket.on("plugin_to_server_event", event => {
@@ -509,22 +383,21 @@ pluginIO.on("connection", socket => {
     socket.on("disconnect", reason => {
         console.log("PLUGIN DISCONNECTED", socket.id, plugin.pluginId, reason);
         for (const pending of pendingRequests.values()) {
-            if (pending.pluginSocketId === socket.id) pending.finish(503, {
-                success: false,
-                error: "Plugin disconnected",
-                requestId: pending.requestId,
-                action: pending.action
-            });
+            if (pending.pluginSocketId === socket.id) pending.finish(503, { success: false, error: "Plugin disconnected", requestId: pending.requestId, action: pending.action });
         }
         plugins.delete(socket.id);
     });
 });
 
 app.get("/api/plugin/data", (req, res) => {
+    const hasBinding = requestedDepartmentIds(req.query || {}).length > 0 || Boolean(req.query?.serverUrl || req.query?.iikoServerUrl);
+    const visible = hasBinding
+        ? Array.from(plugins.values()).filter(plugin => pluginMatchesBinding(plugin, req.query || {}))
+        : Array.from(plugins.values());
     res.json({
         success: true,
-        count: plugins.size,
-        plugins: Array.from(plugins.values()).map(p => ({
+        count: visible.length,
+        plugins: visible.map(p => ({
             pluginId: p.pluginId,
             pluginName: p.pluginName,
             departmentId: p.departmentId,
@@ -532,6 +405,7 @@ app.get("/api/plugin/data", (req, res) => {
             groupId: p.groupId,
             groupName: p.groupName,
             version: p.version,
+            serverUrl: p.serverUrl,
             lastEventAt: p.lastEventAt,
             data: p.lastEvent || null
         }))
