@@ -19,22 +19,66 @@ jobs:
           const p = 'server-core.js';
           let s = fs.readFileSync(p, 'utf8');
           const original = s;
-          const replaceOnce = (a,b) => { if (s.includes(a)) s=s.replace(a,b); };
-          replaceOnce('const plugins = new Map();\nconst pendingRequests = new Map();', 'const plugins = new Map();\nconst pluginRegistry = new Map();\nconst pendingRequests = new Map();');
-          replaceOnce('    const plugin = {\n        socket,\n        socketId: socket.id,', '    const plugin = {\n        socket,\n        socketId: socket.id,\n        online: true,');
-          replaceOnce('    plugins.set(socket.id, plugin);\n    console.log("PLUGIN CONNECTED", socket.id, plugin.pluginId, plugin.pluginName);', `    plugins.set(socket.id, plugin);\n    if (plugin.pluginId) {\n        pluginRegistry.set(String(plugin.pluginId), { pluginId: plugin.pluginId, pluginName: plugin.pluginName, departmentId: plugin.departmentId, departmentName: plugin.departmentName, groupId: plugin.groupId, groupName: plugin.groupName, version: plugin.version, currencyCode: plugin.currencyCode, lastEventAt: plugin.lastEventAt, connectedAt: plugin.connectedAt, disconnectedAt: null, online: true });\n    }\n    console.log("PLUGIN CONNECTED", socket.id, plugin.pluginId, plugin.pluginName);`);
-          replaceOnce('            plugin.currencyCode = message.currencyCode || plugin.currencyCode;\n            plugin.serverUrl = message.serverUrl || plugin.serverUrl;\n        }', `            plugin.currencyCode = message.currencyCode || plugin.currencyCode;\n            plugin.serverUrl = message.serverUrl || plugin.serverUrl;\n            if (plugin.pluginId) {\n                pluginRegistry.set(String(plugin.pluginId), { ...(pluginRegistry.get(String(plugin.pluginId)) || {}), pluginId: plugin.pluginId, pluginName: plugin.pluginName, departmentId: plugin.departmentId, departmentName: plugin.departmentName, groupId: plugin.groupId, groupName: plugin.groupName, version: plugin.version, currencyCode: plugin.currencyCode, lastEventAt: plugin.lastEventAt, connectedAt: plugin.connectedAt, disconnectedAt: null, online: true });\n            }\n        }`);
-          replaceOnce('        plugins.delete(socket.id);\n    });', `        if (plugin.pluginId) {\n            pluginRegistry.set(String(plugin.pluginId), { ...(pluginRegistry.get(String(plugin.pluginId)) || {}), pluginId: plugin.pluginId, pluginName: plugin.pluginName, departmentId: plugin.departmentId, departmentName: plugin.departmentName, groupId: plugin.groupId, groupName: plugin.groupName, version: plugin.version, currencyCode: plugin.currencyCode, lastEventAt: plugin.lastEventAt, connectedAt: plugin.connectedAt, disconnectedAt: now(), online: false });\n        }\n        plugins.delete(socket.id);\n    });`);
-          const oldRoute = `app.get("/api/plugin/data", (req, res) => {\n    const hasBinding = requestedDepartmentIds(req.query || {}).length > 0;\n    const visible = hasBinding ? Array.from(plugins.values()).filter(plugin => pluginMatchesBinding(plugin, req.query || {})) : Array.from(plugins.values());\n    res.json({\n        success: true,\n        count: visible.length,\n        plugins: visible.map(p => ({\n            pluginId: p.pluginId,\n            pluginName: p.pluginName,\n            departmentId: p.departmentId,\n            departmentName: p.departmentName,\n            groupId: p.groupId,\n            groupName: p.groupName,\n            version: p.version,\n            serverUrl: p.serverUrl,\n            lastEventAt: p.lastEventAt,\n            data: p.lastEvent || null\n        }))\n    });\n});`;
-          const newRoute = `app.get("/api/plugin/data", (req, res) => {\n    const hasBinding = requestedDepartmentIds(req.query || {}).length > 0;\n    const source = Array.from(pluginRegistry.values());\n    const visible = hasBinding ? source.filter(plugin => pluginMatchesBinding(plugin, req.query || {})) : source;\n    const pluginsOut = visible.map(p => ({ pluginId: p.pluginId, pluginName: p.pluginName, departmentId: p.departmentId, departmentName: p.departmentName, groupId: p.groupId, groupName: p.groupName, version: p.version, currencyCode: p.currencyCode, lastEventAt: p.lastEventAt || null, connectedAt: p.connectedAt || null, disconnectedAt: p.disconnectedAt || null, online: p.online === true }));\n    const groupsMap = new Map();\n    for (const p of pluginsOut) {\n        const key = String(p.groupId || p.groupName || "unknown");\n        if (!groupsMap.has(key)) groupsMap.set(key, { groupId: p.groupId || null, groupName: p.groupName || "Без группы", departmentId: p.departmentId || null, departmentName: p.departmentName || null, cashRegisters: [] });\n        groupsMap.get(key).cashRegisters.push(p);\n    }\n    res.json({ success: true, count: pluginsOut.length, plugins: pluginsOut, groups: Array.from(groupsMap.values()) });\n});`;
-          replaceOnce(oldRoute, newRoute);
-          if (s === original) throw new Error('No changes applied');
-          fs.writeFileSync(p, s);
+          const oldRoute = `app.get("/api/plugin/data", (req, res) => {
+              const hasBinding = requestedDepartmentIds(req.query || {}).length > 0;
+              const source = Array.from(pluginRegistry.values());
+              const visible = hasBinding ? source.filter(plugin => pluginMatchesBinding(plugin, req.query || {})) : source;
+              const pluginsOut = visible.map(p => ({ pluginId: p.pluginId, pluginName: p.pluginName, departmentId: p.departmentId, departmentName: p.departmentName, groupId: p.groupId, groupName: p.groupName, version: p.version, currencyCode: p.currencyCode, lastEventAt: p.lastEventAt || null, connectedAt: p.connectedAt || null, disconnectedAt: p.disconnectedAt || null, online: p.online === true }));
+              const groupsMap = new Map();
+              for (const p of pluginsOut) {
+                  const key = String(p.groupId || p.groupName || "unknown");
+                  if (!groupsMap.has(key)) groupsMap.set(key, { groupId: p.groupId || null, groupName: p.groupName || "Без группы", departmentId: p.departmentId || null, departmentName: p.departmentName || null, cashRegisters: [] });
+                  groupsMap.get(key).cashRegisters.push(p);
+              }
+              res.json({ success: true, count: pluginsOut.length, plugins: pluginsOut, groups: Array.from(groupsMap.values()) });
+          });`;
+          const newRoute = `app.get("/api/plugin/data", (req, res) => {
+              const hasBinding = requestedDepartmentIds(req.query || {}).length > 0;
+              const source = Array.from(pluginRegistry.values());
+              const visible = hasBinding ? source.filter(plugin => pluginMatchesBinding(plugin, req.query || {})) : source;
+              const activeById = new Map();
+              for (const active of plugins.values()) {
+                  if (active?.pluginId) activeById.set(String(active.pluginId), active);
+              }
+              const pluginsOut = visible.map(p => {
+                  const active = activeById.get(String(p.pluginId));
+                  return {
+                      pluginId: p.pluginId,
+                      pluginName: active?.pluginName || p.pluginName,
+                      departmentId: active?.departmentId || p.departmentId,
+                      departmentName: active?.departmentName || p.departmentName,
+                      groupId: active?.groupId || p.groupId,
+                      groupName: active?.groupName || p.groupName,
+                      version: active?.version || p.version,
+                      currencyCode: active?.currencyCode || p.currencyCode,
+                      lastEventAt: active?.lastEventAt || p.lastEventAt || null,
+                      connectedAt: active?.connectedAt || p.connectedAt || null,
+                      disconnectedAt: active ? null : (p.disconnectedAt || null),
+                      online: !!active,
+                      data: active?.lastEvent || null
+                  };
+              });
+              const groupsMap = new Map();
+              for (const p of pluginsOut) {
+                  const key = String(p.groupId || p.groupName || "unknown");
+                  if (!groupsMap.has(key)) groupsMap.set(key, { groupId: p.groupId || null, groupName: p.groupName || "Без группы", departmentId: p.departmentId || null, departmentName: p.departmentName || null, cashRegisters: [] });
+                  groupsMap.get(key).cashRegisters.push(p);
+              }
+              res.json({ success: true, count: pluginsOut.length, plugins: pluginsOut, groups: Array.from(groupsMap.values()) });
+          });`;
+          if (s.includes(oldRoute)) {
+              s = s.replace(oldRoute, newRoute);
+          } else if (s.includes('const pluginsOut = visible.map(p => ({ pluginId: p.pluginId, pluginName: p.pluginName')) && s.includes('data: active?.lastEvent')) {
+              console.log('Live plugin data patch already present');
+          } else {
+              throw new Error('Expected registry route not found');
+          }
+          if (s !== original) fs.writeFileSync(p, s);
           NODE
       - name: Commit patched server
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add server-core.js
-          git commit -m "Add department group cash registry" || exit 0
+          git commit -m "Restore live cash plugin data" || exit 0
           git push
