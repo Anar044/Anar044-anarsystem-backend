@@ -1,0 +1,54 @@
+name: Patch cash registry
+
+on:
+  workflow_dispatch:
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Patch server-core.js
+        run: |
+          node <<'NODE'
+          const fs = require('fs');
+          const p = 'server-core.js';
+          let s = fs.readFileSync(p, 'utf8');
+
+          const addRegistry = `const plugins = new Map();\nconst pluginRegistry = new Map();\nconst pendingRequests = new Map();`;
+          if (!s.includes('const pluginRegistry = new Map();')) {
+            s = s.replace('const plugins = new Map();\nconst pendingRequests = new Map();', addRegistry);
+          }
+
+          const oldPluginStart = `    const plugin = {\n        socket,\n        socketId: socket.id,`;
+          const newPluginStart = `    const plugin = {\n        socket,\n        socketId: socket.id,\n        online: true,`;
+          if (!s.includes('        online: true,')) s = s.replace(oldPluginStart, newPluginStart);
+
+          const oldAfterPlugin = `    plugins.set(socket.id, plugin);\n    console.log("PLUGIN CONNECTED", socket.id, plugin.pluginId, plugin.pluginName);`;
+          const newAfterPlugin = `    plugins.set(socket.id, plugin);\n    if (plugin.pluginId) {\n        pluginRegistry.set(String(plugin.pluginId), {\n            pluginId: plugin.pluginId,\n            pluginName: plugin.pluginName,\n            departmentId: plugin.departmentId,\n            departmentName: plugin.departmentName,\n            groupId: plugin.groupId,\n            groupName: plugin.groupName,\n            version: plugin.version,\n            currencyCode: plugin.currencyCode,\n            lastEventAt: plugin.lastEventAt,\n            connectedAt: plugin.connectedAt,\n            disconnectedAt: null,\n            online: true\n        });\n    }\n    console.log("PLUGIN CONNECTED", socket.id, plugin.pluginId, plugin.pluginName);`;
+          if (!s.includes('pluginRegistry.set(String(plugin.pluginId)')) s = s.replace(oldAfterPlugin, newAfterPlugin);
+
+          const oldMessageEnd = `            plugin.currencyCode = message.currencyCode || plugin.currencyCode;\n            plugin.serverUrl = message.serverUrl || plugin.serverUrl;\n        }`;
+          const newMessageEnd = `            plugin.currencyCode = message.currencyCode || plugin.currencyCode;\n            plugin.serverUrl = message.serverUrl || plugin.serverUrl;\n            if (plugin.pluginId) {\n                pluginRegistry.set(String(plugin.pluginId), {\n                    ...(pluginRegistry.get(String(plugin.pluginId)) || {}),\n                    pluginId: plugin.pluginId,\n                    pluginName: plugin.pluginName,\n                    departmentId: plugin.departmentId,\n                    departmentName: plugin.departmentName,\n                    groupId: plugin.groupId,\n                    groupName: plugin.groupName,\n                    version: plugin.version,\n                    currencyCode: plugin.currencyCode,\n                    lastEventAt: plugin.lastEventAt,\n                    connectedAt: plugin.connectedAt,\n                    disconnectedAt: null,\n                    online: true\n                });\n            }\n        }`;
+          if (!s.includes('                    disconnectedAt: null,\n                    online: true')) s = s.replace(oldMessageEnd, newMessageEnd);
+
+          const oldDisconnect = `        plugins.delete(socket.id);\n    });`;
+          const newDisconnect = `        if (plugin.pluginId) {\n            pluginRegistry.set(String(plugin.pluginId), {\n                ...(pluginRegistry.get(String(plugin.pluginId)) || {}),\n                pluginId: plugin.pluginId,\n                pluginName: plugin.pluginName,\n                departmentId: plugin.departmentId,\n                departmentName: plugin.departmentName,\n                groupId: plugin.groupId,\n                groupName: plugin.groupName,\n                version: plugin.version,\n                currencyCode: plugin.currencyCode,\n                lastEventAt: plugin.lastEventAt,\n                connectedAt: plugin.connectedAt,\n                disconnectedAt: now(),\n                online: false\n            });\n        }\n        plugins.delete(socket.id);\n    });`;
+          if (!s.includes('disconnectedAt: now()')) s = s.replace(oldDisconnect, newDisconnect);
+
+          const oldRoute = `app.get("/api/plugin/data", (req, res) => {\n    const hasBinding = requestedDepartmentIds(req.query || {}).length > 0;\n    const visible = hasBinding ? Array.from(plugins.values()).filter(plugin => pluginMatchesBinding(plugin, req.query || {})) : Array.from(plugins.values());\n    res.json({\n        success: true,\n        count: visible.length,\n        plugins: visible.map(p => ({\n            pluginId: p.pluginId,\n            pluginName: p.pluginName,\n            departmentId: p.departmentId,\n            departmentName: p.departmentName,\n            groupId: p.groupId,\n            groupName: p.groupName,\n            version: p.version,\n            serverUrl: p.serverUrl,\n            lastEventAt: p.lastEventAt,\n            data: p.lastEvent || null\n        }))\n    });\n});`;
+          const newRoute = `app.get("/api/plugin/data", (req, res) => {\n    const hasBinding = requestedDepartmentIds(req.query || {}).length > 0;\n    const source = Array.from(pluginRegistry.values());\n    const visible = hasBinding\n        ? source.filter(plugin => pluginMatchesBinding(plugin, req.query || {}))\n        : source;\n\n    const pluginsOut = visible.map(p => ({\n        pluginId: p.pluginId,\n        pluginName: p.pluginName,\n        departmentId: p.departmentId,\n        departmentName: p.departmentName,\n        groupId: p.groupId,\n        groupName: p.groupName,\n        version: p.version,\n        currencyCode: p.currencyCode,\n        lastEventAt: p.lastEventAt || null,\n        connectedAt: p.connectedAt || null,\n        disconnectedAt: p.disconnectedAt || null,\n        online: p.online === true\n    }));\n\n    const groupsMap = new Map();\n    for (const p of pluginsOut) {\n        const groupKey = String(p.groupId || p.groupName || 'unknown');\n        if (!groupsMap.has(groupKey)) {\n            groupsMap.set(groupKey, {\n                groupId: p.groupId || null,\n                groupName: p.groupName || 'Без группы',\n                departmentId: p.departmentId || null,\n                departmentName: p.departmentName || null,\n                cashRegisters: []\n            });\n        }\n        groupsMap.get(groupKey).cashRegisters.push(p);\n    }\n\n    const groups = Array.from(groupsMap.values());\n    res.json({\n        success: true,\n        count: pluginsOut.length,\n        plugins: pluginsOut,\n        groups\n    });\n});`;
+          if (!s.includes('cashRegisters: []')) s = s.replace(oldRoute, newRoute);
+
+          if (s === fs.readFileSync(p, 'utf8')) throw new Error('No changes were applied');
+          fs.writeFileSync(p, s);
+          NODE
+      - name: Commit
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add server-core.js
+          git commit -m "Add department terminal group cash registry" || exit 0
+          git push
