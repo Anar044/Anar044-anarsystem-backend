@@ -237,10 +237,8 @@ function firstScalar(value) {
         return null;
     }
     if (typeof value !== "object") return null;
-    if (typeof value === "object") {
-        for (const key of ["name", "Name", "title", "Title", "productName", "ProductName", "itemName", "ItemName", "dishName", "DishName", "value", "Value"]) {
-            if (Object.prototype.hasOwnProperty.call(value, key)) { const found = firstScalar(value[key]); if (found !== null) return found; }
-        }
+    for (const key of ["name", "Name", "title", "Title", "productName", "ProductName", "itemName", "ItemName", "dishName", "DishName", "value", "Value"]) {
+        if (Object.prototype.hasOwnProperty.call(value, key)) { const found = firstScalar(value[key]); if (found !== null) return found; }
     }
     return null;
 }
@@ -383,7 +381,37 @@ pluginIO.on("connection", socket => {
     socket.on("plugin_to_server", raw => {
         const message = normalizeMessage(raw);
         plugin.lastResponseAt = now();
-        plugin.lastEventAt = now();
+
+        // Business events from the Plugin use plugin_to_server. Keep the
+        // latest event as live data so the cash page can read it through
+        // /api/plugin/data. Request responses continue through requestId.
+        if (message && typeof message === "object" && message.pluginEventType) {
+            plugin.lastEvent = message;
+            plugin.lastEventAt = now();
+            console.log("PLUGIN EVENT", plugin.pluginId, message.pluginEventType);
+            if (plugin.pluginId) {
+                pluginRegistry.set(String(plugin.pluginId), {
+                    ...(pluginRegistry.get(String(plugin.pluginId)) || {}),
+                    pluginId: plugin.pluginId,
+                    pluginName: plugin.pluginName,
+                    departmentId: plugin.departmentId,
+                    departmentName: plugin.departmentName,
+                    groupId: plugin.groupId,
+                    groupName: plugin.groupName,
+                    version: plugin.version,
+                    currencyCode: plugin.currencyCode,
+                    lastEventAt: plugin.lastEventAt,
+                    connectedAt: plugin.connectedAt,
+                    disconnectedAt: null,
+                    online: true
+                });
+            }
+            mergeOrderEvent(plugin, message);
+            recordHistory(plugin, message);
+        } else {
+            plugin.lastEventAt = now();
+        }
+
         if (message && typeof message === "object") {
             plugin.pluginId = message.pluginId || plugin.pluginId;
             plugin.pluginName = message.pluginName || plugin.pluginName;
@@ -430,7 +458,28 @@ app.get("/api/plugin/data", (req, res) => {
     const hasBinding = requestedDepartmentIds(req.query || {}).length > 0;
     const source = Array.from(pluginRegistry.values());
     const visible = hasBinding ? source.filter(plugin => pluginMatchesBinding(plugin, req.query || {})) : source;
-    const pluginsOut = visible.map(p => ({ pluginId: p.pluginId, pluginName: p.pluginName, departmentId: p.departmentId, departmentName: p.departmentName, groupId: p.groupId, groupName: p.groupName, version: p.version, currencyCode: p.currencyCode, lastEventAt: p.lastEventAt || null, connectedAt: p.connectedAt || null, disconnectedAt: p.disconnectedAt || null, online: p.online === true }));
+    const activeById = new Map();
+    for (const active of plugins.values()) {
+        if (active?.pluginId) activeById.set(String(active.pluginId), active);
+    }
+    const pluginsOut = visible.map(p => {
+        const active = activeById.get(String(p.pluginId));
+        return {
+            pluginId: p.pluginId,
+            pluginName: active?.pluginName || p.pluginName,
+            departmentId: active?.departmentId || p.departmentId,
+            departmentName: active?.departmentName || p.departmentName,
+            groupId: active?.groupId || p.groupId,
+            groupName: active?.groupName || p.groupName,
+            version: active?.version || p.version,
+            currencyCode: active?.currencyCode || p.currencyCode,
+            lastEventAt: active?.lastEventAt || p.lastEventAt || null,
+            connectedAt: active?.connectedAt || p.connectedAt || null,
+            disconnectedAt: active ? null : (p.disconnectedAt || null),
+            online: !!active,
+            data: active?.lastEvent || null
+        };
+    });
     const groupsMap = new Map();
     for (const p of pluginsOut) {
         const key = String(p.groupId || p.groupName || "unknown");
