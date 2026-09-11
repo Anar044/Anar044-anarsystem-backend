@@ -19,6 +19,8 @@ jobs:
           const p = 'server-core.js';
           let s = fs.readFileSync(p, 'utf8');
           const original = s;
+
+          // 1) Keep live plugin payload in /api/plugin/data.
           const oldRoute = `app.get("/api/plugin/data", (req, res) => {
               const hasBinding = requestedDepartmentIds(req.query || {}).length > 0;
               const source = Array.from(pluginRegistry.values());
@@ -73,6 +75,19 @@ jobs:
           } else {
               throw new Error('Expected registry route not found');
           }
+
+          // 2) Plugin sends business events through plugin_to_server. Save those
+          // events as the live payload as well as handling request responses.
+          const marker = '        plugin.lastResponseAt = now();\n';
+          const insertion = `        plugin.lastResponseAt = now();\n        if (message && typeof message === "object" && message.pluginEventType) {\n            plugin.lastEvent = message;\n            plugin.lastEventAt = now();\n            console.log("PLUGIN EVENT", plugin.pluginId, message.pluginEventType);\n            if (plugin.pluginId) {\n                pluginRegistry.set(String(plugin.pluginId), {\n                    ...(pluginRegistry.get(String(plugin.pluginId)) || {}),\n                    pluginId: plugin.pluginId,\n                    pluginName: plugin.pluginName,\n                    departmentId: plugin.departmentId,\n                    departmentName: plugin.departmentName,\n                    groupId: plugin.groupId,\n                    groupName: plugin.groupName,\n                    version: plugin.version,\n                    currencyCode: plugin.currencyCode,\n                    lastEventAt: plugin.lastEventAt,\n                    connectedAt: plugin.connectedAt,\n                    disconnectedAt: null,\n                    online: true\n                });\n            }\n        }\n`;
+          if (s.includes('console.log("PLUGIN EVENT", plugin.pluginId, message.pluginEventType);')) {
+              console.log('Plugin event capture already present');
+          } else if (s.includes(marker)) {
+              s = s.replace(marker, insertion);
+          } else {
+              throw new Error('plugin_to_server insertion marker not found');
+          }
+
           if (s !== original) fs.writeFileSync(p, s);
           NODE
       - name: Commit patched server
@@ -80,5 +95,5 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add server-core.js
-          git commit -m "Restore live cash plugin data" || exit 0
+          git commit -m "Capture plugin events for cash data" || exit 0
           git push
