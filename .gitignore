@@ -4,3 +4,7 @@ server.log
 .env
 .env.*
 !.env.example
+
+# Runtime-only plugin authentication enrollment state
+plugin-auth-enrollment.json
+plugin-auth-enrollment.json.tmp
