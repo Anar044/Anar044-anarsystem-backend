@@ -28,10 +28,16 @@ const io = new Server(httpServer, {
 const pluginIO = io.of("/plugin-websocket");
 
 const SOCKET_AUTH_MAX_SKEW_SECONDS = 300;
+const AUTH_ENROLLMENT_FILE = path.join(__dirname, "plugin-auth-enrollment.json");
 const usedSocketAuthNonces = new Map();
+const pluginEnrollmentAttempts = new Map();
 
 function configuredSocketAuthSecret() {
     return String(process.env.PLUGIN_SOCKET_AUTH_SECRET || "").trim();
+}
+
+function configuredSocketAuthMasterSecret() {
+    return String(process.env.PLUGIN_SOCKET_AUTH_MASTER_SECRET || configuredSocketAuthSecret()).trim();
 }
 
 function socketAuthAllowsLegacy() {
@@ -48,14 +54,105 @@ function safeHexEqual(left, right) {
     }
 }
 
+function hmacHex(key, payload) {
+    return crypto.createHmac("sha256", key).update(payload, "utf8").digest("hex");
+}
+
+function deriveDeviceAuthSecret(pluginId, departmentId) {
+    const masterSecret = configuredSocketAuthMasterSecret();
+    if (!masterSecret || !pluginId || !departmentId) return "";
+    return hmacHex(masterSecret, `plugin-device-v1|${pluginId}|${departmentId}`);
+}
+
 function cleanupSocketAuthNonces(nowMs) {
     for (const [nonce, expiresAt] of usedSocketAuthNonces.entries()) {
         if (expiresAt <= nowMs) usedSocketAuthNonces.delete(nonce);
     }
 }
 
+function readPluginAuthEnrollmentState() {
+    try {
+        if (!fs.existsSync(AUTH_ENROLLMENT_FILE)) return { version: 1, enabledUntil: null, allowed: {} };
+        const parsed = JSON.parse(fs.readFileSync(AUTH_ENROLLMENT_FILE, "utf8")) || {};
+        return {
+            version: 1,
+            enabledUntil: parsed.enabledUntil || null,
+            allowed: parsed.allowed && typeof parsed.allowed === "object" ? parsed.allowed : {}
+        };
+    } catch (e) {
+        console.error("PLUGIN AUTH ENROLLMENT STATE LOAD FAILED", e.message);
+        return { version: 1, enabledUntil: null, allowed: {} };
+    }
+}
+
+function writePluginAuthEnrollmentState(state) {
+    const tmp = `${AUTH_ENROLLMENT_FILE}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(state, null, 2), { encoding: "utf8", mode: 0o600 });
+    fs.renameSync(tmp, AUTH_ENROLLMENT_FILE);
+    try { fs.chmodSync(AUTH_ENROLLMENT_FILE, 0o600); } catch (_) {}
+}
+
+function enrollmentAttemptAllowed(pluginId) {
+    const key = String(pluginId || "");
+    const nowMs = Date.now();
+    const current = pluginEnrollmentAttempts.get(key);
+    if (!current || nowMs - current.startedAt >= 60000) {
+        pluginEnrollmentAttempts.set(key, { startedAt: nowMs, count: 1 });
+        return true;
+    }
+    current.count += 1;
+    return current.count <= 10;
+}
+
+function enrollmentDecision(body = {}) {
+    const pluginId = String(body.pluginId || "").trim();
+    const departmentId = String(body.departmentId || "").trim();
+    const groupId = String(body.groupId || "").trim();
+    const pluginName = String(body.pluginName || "").trim();
+
+    if (!pluginId || !departmentId) return { allowed: false, status: 400, code: "PLUGIN_IDENTITY_REQUIRED" };
+    if (!enrollmentAttemptAllowed(pluginId)) return { allowed: false, status: 429, code: "PLUGIN_ENROLLMENT_RATE_LIMIT" };
+
+    const state = readPluginAuthEnrollmentState();
+    const enabledUntilMs = Date.parse(String(state.enabledUntil || ""));
+    if (!Number.isFinite(enabledUntilMs) || enabledUntilMs <= Date.now()) {
+        return { allowed: false, status: 403, code: "PLUGIN_ENROLLMENT_CLOSED" };
+    }
+
+    const entry = state.allowed[pluginId];
+    if (!entry) return { allowed: false, status: 403, code: "PLUGIN_ENROLLMENT_NOT_ALLOWED" };
+    if (String(entry.departmentId || "") !== departmentId) {
+        return { allowed: false, status: 403, code: "PLUGIN_ENROLLMENT_IDENTITY_MISMATCH" };
+    }
+    if (entry.groupId && groupId && String(entry.groupId) !== groupId) {
+        return { allowed: false, status: 403, code: "PLUGIN_ENROLLMENT_IDENTITY_MISMATCH" };
+    }
+    if (entry.pluginName && pluginName && String(entry.pluginName).toLowerCase() !== pluginName.toLowerCase()) {
+        return { allowed: false, status: 403, code: "PLUGIN_ENROLLMENT_IDENTITY_MISMATCH" };
+    }
+
+    return { allowed: true, state, entry, pluginId, departmentId };
+}
+
+function markPluginEnrolled(decision, body = {}) {
+    try {
+        const state = decision.state || readPluginAuthEnrollmentState();
+        const entry = state.allowed[decision.pluginId] || {};
+        state.allowed[decision.pluginId] = {
+            ...entry,
+            enrolledAt: new Date().toISOString(),
+            lastEnrolledPluginName: String(body.pluginName || entry.pluginName || ""),
+            lastEnrolledVersion: String(body.version || "")
+        };
+        writePluginAuthEnrollmentState(state);
+    } catch (e) {
+        console.error("PLUGIN AUTH ENROLLMENT STATE SAVE FAILED", e.message);
+    }
+}
+
 function verifySocketHandshake(socket) {
-    const secret = configuredSocketAuthSecret();
+    const sharedSecret = configuredSocketAuthSecret();
+    const masterSecret = configuredSocketAuthMasterSecret();
     const q = socket.handshake.query || {};
     const a = socket.handshake.auth || {};
     const pluginId = String(q.pluginId || a.pluginId || "").trim();
@@ -65,14 +162,14 @@ function verifySocketHandshake(socket) {
     const authNonce = String(q.authNonce || a.authNonce || "").trim();
     const authSig = String(q.authSig || a.authSig || "").trim().toLowerCase();
 
-    if (!secret) {
-        return { accepted: true, authenticated: false, authMode: "server-disabled" };
+    if (!sharedSecret && !masterSecret) {
+        return { accepted: true, authenticated: false, authMode: "server-disabled", authKeyScope: null };
     }
 
     const hasAuthAttempt = Boolean(authMode || authTs || authNonce || authSig);
     if (!hasAuthAttempt || authMode === "legacy") {
         if (socketAuthAllowsLegacy()) {
-            return { accepted: true, authenticated: false, authMode: "legacy" };
+            return { accepted: true, authenticated: false, authMode: "legacy", authKeyScope: null };
         }
         return { accepted: false, code: "PLUGIN_AUTH_REQUIRED" };
     }
@@ -98,13 +195,23 @@ function verifySocketHandshake(socket) {
     }
 
     const payload = `${pluginId}|${departmentId}|${authTs}|${authNonce}`;
-    const expected = crypto.createHmac("sha256", secret).update(payload, "utf8").digest("hex");
-    if (!safeHexEqual(authSig, expected)) {
+    let authKeyScope = null;
+
+    if (sharedSecret && safeHexEqual(authSig, hmacHex(sharedSecret, payload))) {
+        authKeyScope = "shared-v1";
+    } else {
+        const deviceSecret = deriveDeviceAuthSecret(pluginId, departmentId);
+        if (deviceSecret && safeHexEqual(authSig, hmacHex(deviceSecret, payload))) {
+            authKeyScope = "device-v1";
+        }
+    }
+
+    if (!authKeyScope) {
         return { accepted: false, code: "PLUGIN_AUTH_SIGNATURE_INVALID" };
     }
 
     usedSocketAuthNonces.set(authNonce, nowMs + SOCKET_AUTH_MAX_SKEW_SECONDS * 1000);
-    return { accepted: true, authenticated: true, authMode: "hmac-sha256-v1" };
+    return { accepted: true, authenticated: true, authMode: "hmac-sha256-v1", authKeyScope };
 }
 
 pluginIO.use((socket, next) => {
@@ -410,6 +517,28 @@ function enrichOrders(value, details, plugin) {
 
 app.get("/health", (req, res) => res.json({ success: true, service: "anarsystem-backend", plugins: plugins.size }));
 
+app.post("/api/plugin/auth/enroll", (req, res) => {
+    const body = req.body || {};
+    const decision = enrollmentDecision(body);
+    if (!decision.allowed) {
+        return res.status(decision.status || 403).json({ success: false, error: decision.code || "PLUGIN_ENROLLMENT_DENIED" });
+    }
+
+    const deviceSecret = deriveDeviceAuthSecret(decision.pluginId, decision.departmentId);
+    if (!deviceSecret) {
+        return res.status(503).json({ success: false, error: "PLUGIN_AUTH_MASTER_SECRET_NOT_CONFIGURED" });
+    }
+
+    markPluginEnrolled(decision, body);
+    console.log("PLUGIN AUTH ENROLLED", decision.pluginId, String(body.pluginName || ""), "device-v1");
+    return res.json({
+        success: true,
+        socketAuthSecret: deviceSecret,
+        authMode: "hmac-sha256-v1",
+        authKeyScope: "device-v1"
+    });
+});
+
 app.post("/api/plugin/request", async (req, res) => {
     const body = req.body || {};
     const action = body.action;
@@ -456,6 +585,7 @@ pluginIO.on("connection", socket => {
         serverUrl: a.serverUrl || q.serverUrl || null,
         authenticated: socket.data?.pluginAuth?.authenticated === true,
         authMode: socket.data?.pluginAuth?.authMode || "legacy",
+        authKeyScope: socket.data?.pluginAuth?.authKeyScope || null,
         connectedAt: now(),
         lastEventAt: null,
         lastResponseAt: null,
@@ -468,9 +598,9 @@ pluginIO.on("connection", socket => {
     restoreOrderDetails(plugin, saved);
     plugins.set(socket.id, plugin);
     if (plugin.pluginId) {
-        pluginRegistry.set(String(plugin.pluginId), { pluginId: plugin.pluginId, pluginName: plugin.pluginName, departmentId: plugin.departmentId, departmentName: plugin.departmentName, groupId: plugin.groupId, groupName: plugin.groupName, version: plugin.version, currencyCode: plugin.currencyCode, authenticated: plugin.authenticated, authMode: plugin.authMode, lastEventAt: plugin.lastEventAt, connectedAt: plugin.connectedAt, disconnectedAt: null, online: true });
+        pluginRegistry.set(String(plugin.pluginId), { pluginId: plugin.pluginId, pluginName: plugin.pluginName, departmentId: plugin.departmentId, departmentName: plugin.departmentName, groupId: plugin.groupId, groupName: plugin.groupName, version: plugin.version, currencyCode: plugin.currencyCode, authenticated: plugin.authenticated, authMode: plugin.authMode, authKeyScope: plugin.authKeyScope, lastEventAt: plugin.lastEventAt, connectedAt: plugin.connectedAt, disconnectedAt: null, online: true });
     }
-    console.log("PLUGIN CONNECTED", socket.id, plugin.pluginId, plugin.pluginName, "auth", plugin.authMode, plugin.authenticated ? "verified" : "legacy");
+    console.log("PLUGIN CONNECTED", socket.id, plugin.pluginId, plugin.pluginName, "auth", plugin.authMode, plugin.authKeyScope || "-", plugin.authenticated ? "verified" : "legacy");
 
     socket.on("plugin_to_server", raw => {
         const message = normalizeMessage(raw);
@@ -517,7 +647,7 @@ pluginIO.on("connection", socket => {
             plugin.currencyCode = message.currencyCode || plugin.currencyCode;
             plugin.serverUrl = message.serverUrl || plugin.serverUrl;
             if (plugin.pluginId) {
-                pluginRegistry.set(String(plugin.pluginId), { ...(pluginRegistry.get(String(plugin.pluginId)) || {}), pluginId: plugin.pluginId, pluginName: plugin.pluginName, departmentId: plugin.departmentId, departmentName: plugin.departmentName, groupId: plugin.groupId, groupName: plugin.groupName, version: plugin.version, currencyCode: plugin.currencyCode, authenticated: plugin.authenticated, authMode: plugin.authMode, lastEventAt: plugin.lastEventAt, connectedAt: plugin.connectedAt, disconnectedAt: null, online: true });
+                pluginRegistry.set(String(plugin.pluginId), { ...(pluginRegistry.get(String(plugin.pluginId)) || {}), pluginId: plugin.pluginId, pluginName: plugin.pluginName, departmentId: plugin.departmentId, departmentName: plugin.departmentName, groupId: plugin.groupId, groupName: plugin.groupName, version: plugin.version, currencyCode: plugin.currencyCode, authenticated: plugin.authenticated, authMode: plugin.authMode, authKeyScope: plugin.authKeyScope, lastEventAt: plugin.lastEventAt, connectedAt: plugin.connectedAt, disconnectedAt: null, online: true });
             }
         }
         const id = message?.requestId || message?.data?.requestId || message?.result?.requestId;
@@ -542,7 +672,7 @@ pluginIO.on("connection", socket => {
             if (pending.pluginSocketId === socket.id) pending.finish(503, { success: false, error: "Plugin disconnected", requestId: pending.requestId, action: pending.action });
         }
         if (plugin.pluginId) {
-            pluginRegistry.set(String(plugin.pluginId), { ...(pluginRegistry.get(String(plugin.pluginId)) || {}), pluginId: plugin.pluginId, pluginName: plugin.pluginName, departmentId: plugin.departmentId, departmentName: plugin.departmentName, groupId: plugin.groupId, groupName: plugin.groupName, version: plugin.version, currencyCode: plugin.currencyCode, authenticated: plugin.authenticated, authMode: plugin.authMode, lastEventAt: plugin.lastEventAt, connectedAt: plugin.connectedAt, disconnectedAt: now(), online: false });
+            pluginRegistry.set(String(plugin.pluginId), { ...(pluginRegistry.get(String(plugin.pluginId)) || {}), pluginId: plugin.pluginId, pluginName: plugin.pluginName, departmentId: plugin.departmentId, departmentName: plugin.departmentName, groupId: plugin.groupId, groupName: plugin.groupName, version: plugin.version, currencyCode: plugin.currencyCode, authenticated: plugin.authenticated, authMode: plugin.authMode, authKeyScope: plugin.authKeyScope, lastEventAt: plugin.lastEventAt, connectedAt: plugin.connectedAt, disconnectedAt: now(), online: false });
         }
         plugins.delete(socket.id);
     });
@@ -569,6 +699,7 @@ app.get("/api/plugin/data", (req, res) => {
             currencyCode: active?.currencyCode || p.currencyCode,
             authenticated: active?.authenticated === true,
             authMode: active?.authMode || p.authMode || "legacy",
+            authKeyScope: active?.authKeyScope || p.authKeyScope || null,
             lastEventAt: active?.lastEventAt || p.lastEventAt || null,
             connectedAt: active?.connectedAt || p.connectedAt || null,
             disconnectedAt: active ? null : (p.disconnectedAt || null),
