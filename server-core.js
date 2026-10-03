@@ -26,6 +26,98 @@ const io = new Server(httpServer, {
 });
 
 const pluginIO = io.of("/plugin-websocket");
+
+const SOCKET_AUTH_MAX_SKEW_SECONDS = 300;
+const usedSocketAuthNonces = new Map();
+
+function configuredSocketAuthSecret() {
+    return String(process.env.PLUGIN_SOCKET_AUTH_SECRET || "").trim();
+}
+
+function socketAuthAllowsLegacy() {
+    return String(process.env.PLUGIN_SOCKET_AUTH_ALLOW_LEGACY ?? "true").trim().toLowerCase() !== "false";
+}
+
+function safeHexEqual(left, right) {
+    try {
+        const a = Buffer.from(String(left || ""), "hex");
+        const b = Buffer.from(String(right || ""), "hex");
+        return a.length > 0 && a.length === b.length && crypto.timingSafeEqual(a, b);
+    } catch (_) {
+        return false;
+    }
+}
+
+function cleanupSocketAuthNonces(nowMs) {
+    for (const [nonce, expiresAt] of usedSocketAuthNonces.entries()) {
+        if (expiresAt <= nowMs) usedSocketAuthNonces.delete(nonce);
+    }
+}
+
+function verifySocketHandshake(socket) {
+    const secret = configuredSocketAuthSecret();
+    const q = socket.handshake.query || {};
+    const a = socket.handshake.auth || {};
+    const pluginId = String(q.pluginId || a.pluginId || "").trim();
+    const departmentId = String(q.departmentId || a.departmentId || "").trim();
+    const authMode = String(q.authMode || a.authMode || "").trim();
+    const authTs = String(q.authTs || a.authTs || "").trim();
+    const authNonce = String(q.authNonce || a.authNonce || "").trim();
+    const authSig = String(q.authSig || a.authSig || "").trim().toLowerCase();
+
+    if (!secret) {
+        return { accepted: true, authenticated: false, authMode: "server-disabled" };
+    }
+
+    const hasAuthAttempt = Boolean(authMode || authTs || authNonce || authSig);
+    if (!hasAuthAttempt || authMode === "legacy") {
+        if (socketAuthAllowsLegacy()) {
+            return { accepted: true, authenticated: false, authMode: "legacy" };
+        }
+        return { accepted: false, code: "PLUGIN_AUTH_REQUIRED" };
+    }
+
+    if (authMode !== "hmac-sha256-v1" || !pluginId || !departmentId || !authTs || !authNonce || !authSig) {
+        return { accepted: false, code: "PLUGIN_AUTH_INVALID" };
+    }
+
+    const ts = Number(authTs);
+    const nowSeconds = Math.floor(Date.now() / 1000);
+    if (!Number.isFinite(ts) || Math.abs(nowSeconds - ts) > SOCKET_AUTH_MAX_SKEW_SECONDS) {
+        return { accepted: false, code: "PLUGIN_AUTH_EXPIRED" };
+    }
+
+    if (!/^[a-zA-Z0-9_-]{16,128}$/.test(authNonce)) {
+        return { accepted: false, code: "PLUGIN_AUTH_NONCE_INVALID" };
+    }
+
+    const nowMs = Date.now();
+    cleanupSocketAuthNonces(nowMs);
+    if (usedSocketAuthNonces.has(authNonce)) {
+        return { accepted: false, code: "PLUGIN_AUTH_REPLAY" };
+    }
+
+    const payload = `${pluginId}|${departmentId}|${authTs}|${authNonce}`;
+    const expected = crypto.createHmac("sha256", secret).update(payload, "utf8").digest("hex");
+    if (!safeHexEqual(authSig, expected)) {
+        return { accepted: false, code: "PLUGIN_AUTH_SIGNATURE_INVALID" };
+    }
+
+    usedSocketAuthNonces.set(authNonce, nowMs + SOCKET_AUTH_MAX_SKEW_SECONDS * 1000);
+    return { accepted: true, authenticated: true, authMode: "hmac-sha256-v1" };
+}
+
+pluginIO.use((socket, next) => {
+    const result = verifySocketHandshake(socket);
+    socket.data.pluginAuth = result;
+    if (!result.accepted) {
+        const error = new Error(result.code || "PLUGIN_AUTH_REJECTED");
+        error.data = { code: result.code || "PLUGIN_AUTH_REJECTED" };
+        return next(error);
+    }
+    next();
+});
+
 const plugins = new Map();
 const pluginRegistry = new Map();
 const pendingRequests = new Map();
@@ -362,6 +454,8 @@ pluginIO.on("connection", socket => {
         version: q.version || a.version || null,
         currencyCode: q.currencyCode || a.currencyCode || null,
         serverUrl: a.serverUrl || q.serverUrl || null,
+        authenticated: socket.data?.pluginAuth?.authenticated === true,
+        authMode: socket.data?.pluginAuth?.authMode || "legacy",
         connectedAt: now(),
         lastEventAt: null,
         lastResponseAt: null,
@@ -374,9 +468,9 @@ pluginIO.on("connection", socket => {
     restoreOrderDetails(plugin, saved);
     plugins.set(socket.id, plugin);
     if (plugin.pluginId) {
-        pluginRegistry.set(String(plugin.pluginId), { pluginId: plugin.pluginId, pluginName: plugin.pluginName, departmentId: plugin.departmentId, departmentName: plugin.departmentName, groupId: plugin.groupId, groupName: plugin.groupName, version: plugin.version, currencyCode: plugin.currencyCode, lastEventAt: plugin.lastEventAt, connectedAt: plugin.connectedAt, disconnectedAt: null, online: true });
+        pluginRegistry.set(String(plugin.pluginId), { pluginId: plugin.pluginId, pluginName: plugin.pluginName, departmentId: plugin.departmentId, departmentName: plugin.departmentName, groupId: plugin.groupId, groupName: plugin.groupName, version: plugin.version, currencyCode: plugin.currencyCode, authenticated: plugin.authenticated, authMode: plugin.authMode, lastEventAt: plugin.lastEventAt, connectedAt: plugin.connectedAt, disconnectedAt: null, online: true });
     }
-    console.log("PLUGIN CONNECTED", socket.id, plugin.pluginId, plugin.pluginName);
+    console.log("PLUGIN CONNECTED", socket.id, plugin.pluginId, plugin.pluginName, "auth", plugin.authMode, plugin.authenticated ? "verified" : "legacy");
 
     socket.on("plugin_to_server", raw => {
         const message = normalizeMessage(raw);
@@ -423,7 +517,7 @@ pluginIO.on("connection", socket => {
             plugin.currencyCode = message.currencyCode || plugin.currencyCode;
             plugin.serverUrl = message.serverUrl || plugin.serverUrl;
             if (plugin.pluginId) {
-                pluginRegistry.set(String(plugin.pluginId), { ...(pluginRegistry.get(String(plugin.pluginId)) || {}), pluginId: plugin.pluginId, pluginName: plugin.pluginName, departmentId: plugin.departmentId, departmentName: plugin.departmentName, groupId: plugin.groupId, groupName: plugin.groupName, version: plugin.version, currencyCode: plugin.currencyCode, lastEventAt: plugin.lastEventAt, connectedAt: plugin.connectedAt, disconnectedAt: null, online: true });
+                pluginRegistry.set(String(plugin.pluginId), { ...(pluginRegistry.get(String(plugin.pluginId)) || {}), pluginId: plugin.pluginId, pluginName: plugin.pluginName, departmentId: plugin.departmentId, departmentName: plugin.departmentName, groupId: plugin.groupId, groupName: plugin.groupName, version: plugin.version, currencyCode: plugin.currencyCode, authenticated: plugin.authenticated, authMode: plugin.authMode, lastEventAt: plugin.lastEventAt, connectedAt: plugin.connectedAt, disconnectedAt: null, online: true });
             }
         }
         const id = message?.requestId || message?.data?.requestId || message?.result?.requestId;
@@ -448,7 +542,7 @@ pluginIO.on("connection", socket => {
             if (pending.pluginSocketId === socket.id) pending.finish(503, { success: false, error: "Plugin disconnected", requestId: pending.requestId, action: pending.action });
         }
         if (plugin.pluginId) {
-            pluginRegistry.set(String(plugin.pluginId), { ...(pluginRegistry.get(String(plugin.pluginId)) || {}), pluginId: plugin.pluginId, pluginName: plugin.pluginName, departmentId: plugin.departmentId, departmentName: plugin.departmentName, groupId: plugin.groupId, groupName: plugin.groupName, version: plugin.version, currencyCode: plugin.currencyCode, lastEventAt: plugin.lastEventAt, connectedAt: plugin.connectedAt, disconnectedAt: now(), online: false });
+            pluginRegistry.set(String(plugin.pluginId), { ...(pluginRegistry.get(String(plugin.pluginId)) || {}), pluginId: plugin.pluginId, pluginName: plugin.pluginName, departmentId: plugin.departmentId, departmentName: plugin.departmentName, groupId: plugin.groupId, groupName: plugin.groupName, version: plugin.version, currencyCode: plugin.currencyCode, authenticated: plugin.authenticated, authMode: plugin.authMode, lastEventAt: plugin.lastEventAt, connectedAt: plugin.connectedAt, disconnectedAt: now(), online: false });
         }
         plugins.delete(socket.id);
     });
@@ -473,6 +567,8 @@ app.get("/api/plugin/data", (req, res) => {
             groupName: active?.groupName || p.groupName,
             version: active?.version || p.version,
             currencyCode: active?.currencyCode || p.currencyCode,
+            authenticated: active?.authenticated === true,
+            authMode: active?.authMode || p.authMode || "legacy",
             lastEventAt: active?.lastEventAt || p.lastEventAt || null,
             connectedAt: active?.connectedAt || p.connectedAt || null,
             disconnectedAt: active ? null : (p.disconnectedAt || null),
