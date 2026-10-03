@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - feature/socket-auth-v1
+      - feature/socket-auth-auto-enroll-v1
   workflow_dispatch:
 
 jobs:
@@ -25,9 +26,31 @@ jobs:
           set -euo pipefail
           export PLUGIN_SOCKET_AUTH_SECRET="ci-test-secret-not-production"
           export PLUGIN_SOCKET_AUTH_ALLOW_LEGACY="true"
+
+          node <<'NODE'
+          const fs = require("fs");
+          const state = {
+            version: 1,
+            createdAt: new Date().toISOString(),
+            enabledUntil: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+            allowed: {
+              "11111111-1111-1111-1111-111111111111": {
+                pluginId: "11111111-1111-1111-1111-111111111111",
+                pluginName: "CI-POS",
+                departmentId: "22222222-2222-2222-2222-222222222222",
+                groupId: "33333333-3333-3333-3333-333333333333"
+              }
+            }
+          };
+          fs.writeFileSync("plugin-auth-enrollment.json", JSON.stringify(state, null, 2));
+          NODE
+
+          node --check scripts/open-plugin-auth-enrollment.js
+          node --check scripts/close-plugin-auth-enrollment.js
+
           node server-core.js > /tmp/sh-backend.log 2>&1 &
           SERVER_PID=$!
-          trap 'kill $SERVER_PID || true; cat /tmp/sh-backend.log || true' EXIT
+          trap 'kill $SERVER_PID || true; rm -f plugin-auth-enrollment.json plugin-auth-enrollment.json.tmp; cat /tmp/sh-backend.log || true' EXIT
 
           for i in $(seq 1 20); do
             if curl -fsS http://127.0.0.1:3000/health >/dev/null; then break; fi
@@ -81,7 +104,43 @@ jobs:
 
             await connect({ pluginId, departmentId, authMode: "hmac-sha256-v1", authTs, authNonce, authSig }, true);
             await connect({ pluginId, departmentId, authMode: "hmac-sha256-v1", authTs, authNonce: crypto.randomBytes(16).toString("hex"), authSig: "00".repeat(32) }, false);
-            console.log("Socket auth smoke test passed");
+
+            const enrollResponse = await fetch("http://127.0.0.1:3000/api/plugin/auth/enroll", {
+              method: "POST",
+              headers: { "content-type": "application/json" },
+              body: JSON.stringify({
+                pluginId,
+                departmentId,
+                groupId: "33333333-3333-3333-3333-333333333333",
+                pluginName: "CI-POS",
+                version: "ci"
+              })
+            });
+            if (!enrollResponse.ok) throw new Error("allowed plugin enrollment failed: HTTP " + enrollResponse.status);
+            const enrolled = await enrollResponse.json();
+            if (!enrolled.success || !enrolled.socketAuthSecret || enrolled.authKeyScope !== "device-v1") {
+              throw new Error("invalid enrollment response");
+            }
+
+            const deviceTs = String(Math.floor(Date.now() / 1000));
+            const deviceNonce = crypto.randomBytes(16).toString("hex");
+            const devicePayload = [pluginId, departmentId, deviceTs, deviceNonce].join("|");
+            const deviceSig = crypto.createHmac("sha256", enrolled.socketAuthSecret).update(devicePayload).digest("hex");
+            await connect({ pluginId, departmentId, authMode: "hmac-sha256-v1", authTs: deviceTs, authNonce: deviceNonce, authSig: deviceSig }, true);
+
+            const denied = await fetch("http://127.0.0.1:3000/api/plugin/auth/enroll", {
+              method: "POST",
+              headers: { "content-type": "application/json" },
+              body: JSON.stringify({
+                pluginId: "99999999-9999-9999-9999-999999999999",
+                departmentId,
+                groupId: "33333333-3333-3333-3333-333333333333",
+                pluginName: "UNKNOWN-POS"
+              })
+            });
+            if (denied.status !== 403) throw new Error("unknown plugin enrollment was not denied");
+
+            console.log("Socket auth + device enrollment smoke test passed");
           })().catch(err => {
             console.error(err);
             process.exit(1);
