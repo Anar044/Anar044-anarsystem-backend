@@ -1,0 +1,89 @@
+name: Socket Auth Check
+
+on:
+  push:
+    branches:
+      - feature/socket-auth-v1
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Syntax check
+        run: node --check server-core.js
+
+      - name: Socket auth smoke test
+        shell: bash
+        run: |
+          set -euo pipefail
+          export PLUGIN_SOCKET_AUTH_SECRET="ci-test-secret-not-production"
+          export PLUGIN_SOCKET_AUTH_ALLOW_LEGACY="true"
+          node server-core.js > /tmp/sh-backend.log 2>&1 &
+          SERVER_PID=$!
+          trap 'kill $SERVER_PID || true; cat /tmp/sh-backend.log || true' EXIT
+
+          for i in $(seq 1 20); do
+            if curl -fsS http://127.0.0.1:3000/health >/dev/null; then break; fi
+            sleep 1
+          done
+
+          node <<'NODE'
+          const crypto = require("crypto");
+          const { io } = require("socket.io-client");
+
+          const base = "http://127.0.0.1:3000/plugin-websocket";
+          const options = {
+            path: "/plugin-websocket/socket.io",
+            transports: ["polling"],
+            reconnection: false,
+            timeout: 5000
+          };
+
+          function connect(query, shouldConnect) {
+            return new Promise((resolve, reject) => {
+              const socket = io(base, { ...options, query });
+              const timer = setTimeout(() => {
+                socket.close();
+                reject(new Error("socket auth test timeout"));
+              }, 7000);
+              socket.on("connect", () => {
+                clearTimeout(timer);
+                socket.close();
+                if (!shouldConnect) reject(new Error("invalid signature unexpectedly connected"));
+                else resolve();
+              });
+              socket.on("connect_error", err => {
+                clearTimeout(timer);
+                socket.close();
+                if (shouldConnect) reject(err);
+                else resolve();
+              });
+            });
+          }
+
+          (async () => {
+            const pluginId = "11111111-1111-1111-1111-111111111111";
+            const departmentId = "22222222-2222-2222-2222-222222222222";
+
+            await connect({ pluginId, departmentId, authMode: "legacy" }, true);
+
+            const authTs = String(Math.floor(Date.now() / 1000));
+            const authNonce = crypto.randomBytes(16).toString("hex");
+            const payload = [pluginId, departmentId, authTs, authNonce].join("|");
+            const authSig = crypto.createHmac("sha256", "ci-test-secret-not-production").update(payload).digest("hex");
+
+            await connect({ pluginId, departmentId, authMode: "hmac-sha256-v1", authTs, authNonce, authSig }, true);
+            await connect({ pluginId, departmentId, authMode: "hmac-sha256-v1", authTs, authNonce: crypto.randomBytes(16).toString("hex"), authSig: "00".repeat(32) }, false);
+            console.log("Socket auth smoke test passed");
+          })().catch(err => {
+            console.error(err);
+            process.exit(1);
+          });
+          NODE
