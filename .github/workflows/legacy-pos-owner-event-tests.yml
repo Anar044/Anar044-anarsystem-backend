@@ -24,3 +24,4 @@ jobs:
       - run: node --check server-core.js
       - run: node --check owner-event-forwarder.js
       - run: bash -n scripts/install-rms2-push-pilot.sh
+      - run: bash -n scripts/finish-rms2-push-pilot.sh
