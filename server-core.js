@@ -5,6 +5,7 @@ const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
 const { Server } = require("socket.io");
+const { createOwnerEventForwarder } = require("./owner-event-forwarder");
 
 const app = express();
 const httpServer = http.createServer(app);
@@ -228,6 +229,9 @@ pluginIO.use((socket, next) => {
 const plugins = new Map();
 const pluginRegistry = new Map();
 const pendingRequests = new Map();
+// Optional event notification forwarding; disabled unless VPS webhook
+// destination and token are both explicitly configured.
+const ownerEventForwarder = createOwnerEventForwarder();
 
 let historyStore = {};
 try {
@@ -593,6 +597,15 @@ pluginIO.on("connection", socket => {
         orderDetails: new Map(),
         orderHistory: new Map()
     };
+    // This identity is captured from the authenticated socket handshake,
+    // not from mutable event metadata. Only HMAC-verified sockets are eligible.
+    const trustedPushSource = Object.freeze({
+        pluginId: plugin.pluginId, departmentId: plugin.departmentId,
+        departmentName: plugin.departmentName, version: plugin.version,
+        currencyCode: plugin.currencyCode, serverUrl: plugin.serverUrl,
+        groupId: plugin.groupId, groupName: plugin.groupName,
+        authenticated: plugin.authenticated, authKeyScope: plugin.authKeyScope
+    });
     const saved = historyStore[String(plugin.pluginId || "unknown")];
     if (saved) for (const [key, list] of Object.entries(saved)) if (Array.isArray(list)) plugin.orderHistory.set(key, list);
     restoreOrderDetails(plugin, saved);
@@ -632,6 +645,8 @@ pluginIO.on("connection", socket => {
             }
             mergeOrderEvent(plugin, message);
             recordHistory(plugin, message);
+            // Best effort; independent of POS response and local history.
+            ownerEventForwarder.enqueue(trustedPushSource, message);
         } else {
             plugin.lastEventAt = now();
         }
@@ -664,6 +679,7 @@ pluginIO.on("connection", socket => {
         plugin.lastEvent = event;
         mergeOrderEvent(plugin, event);
         recordHistory(plugin, event);
+        ownerEventForwarder.enqueue(trustedPushSource, event);
     });
 
     socket.on("disconnect", reason => {
