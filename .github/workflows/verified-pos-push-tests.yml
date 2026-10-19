@@ -1,0 +1,25 @@
+name: Verified VPS POS Push Bridge
+on:
+  push:
+    branches:
+      - feature/pos-push-verified-socket-v1
+  pull_request:
+    paths:
+      - 'owner-event-forwarder.js'
+      - 'server-core.js'
+      - 'package.json'
+      - 'tests/**'
+      - '.github/workflows/verified-pos-push-tests.yml'
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci
+      - run: npm test
+      - run: node --check server-core.js
+      - run: node --check owner-event-forwarder.js
