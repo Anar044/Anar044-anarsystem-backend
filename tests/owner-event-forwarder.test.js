@@ -106,3 +106,17 @@ test("event-controlled plugin metadata cannot change signed socket department", 
     assert.equal(body.departmentId, plugin.departmentId);
     assert.equal(body.pluginId, plugin.pluginId);
 });
+
+test("real iikoFront discount events are eligible, surcharges are not",()=>{
+ const add={...discount,uuid:"df4d9509-46f5-410b-96bb-fdc7abbc3a61",
+   pluginEventType:"addingDiscount",data:{name:"Endirim 10%",orderNum:45,valuePercent:10}};
+ const remove={...add,pluginEventType:"removingDiscount"};
+ const a=forwardedEvent(plugin,add);
+ assert.equal(a.event,"addingDiscount");
+ assert.equal(a.data.orderNum,45);
+ assert.equal(a.data.name,"Endirim 10%");
+ assert.equal(forwardedEvent(plugin,remove).event,"removingDiscount");
+ assert.equal(isAlertCandidate("addingSurcharge"),false);
+ assert.equal(isAlertCandidate("removingSurcharge"),false);
+ assert.equal(forwardedEvent(plugin,{...add,pluginEventType:"addingSurcharge"}),null);
+});
