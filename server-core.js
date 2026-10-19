@@ -5,6 +5,7 @@ const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
 const { Server } = require("socket.io");
+const { createOwnerEventForwarder } = require("./owner-event-forwarder");
 
 const app = express();
 const httpServer = http.createServer(app);
@@ -29,6 +30,8 @@ const pluginIO = io.of("/plugin-websocket");
 const plugins = new Map();
 const pluginRegistry = new Map();
 const pendingRequests = new Map();
+// Event forwarding is opt-in. When disabled it never changes the POS flow.
+const ownerEventForwarder = createOwnerEventForwarder();
 
 let historyStore = {};
 try {
@@ -426,6 +429,8 @@ pluginIO.on("connection", socket => {
                 pluginRegistry.set(String(plugin.pluginId), { ...(pluginRegistry.get(String(plugin.pluginId)) || {}), pluginId: plugin.pluginId, pluginName: plugin.pluginName, departmentId: plugin.departmentId, departmentName: plugin.departmentName, groupId: plugin.groupId, groupName: plugin.groupName, version: plugin.version, currencyCode: plugin.currencyCode, lastEventAt: plugin.lastEventAt, connectedAt: plugin.connectedAt, disconnectedAt: null, online: true });
             }
         }
+        if (message && typeof message === "object" && message.pluginEventType)
+            ownerEventForwarder.enqueue(plugin, message);
         const id = message?.requestId || message?.data?.requestId || message?.result?.requestId;
         if (!id) return;
         const pending = pendingRequests.get(id);
@@ -440,6 +445,7 @@ pluginIO.on("connection", socket => {
         plugin.lastEvent = event;
         mergeOrderEvent(plugin, event);
         recordHistory(plugin, event);
+        ownerEventForwarder.enqueue(plugin, event);
     });
 
     socket.on("disconnect", reason => {
