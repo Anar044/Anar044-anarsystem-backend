@@ -5,6 +5,7 @@ const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
 const { Server } = require("socket.io");
+const { createBackendSecurity } = require("./security");
 
 const app = express();
 const httpServer = http.createServer(app);
@@ -12,9 +13,12 @@ const PORT = 3000;
 const REQUEST_TIMEOUT_MS = 30000;
 const HISTORY_FILE = path.join(__dirname, "order-history.json");
 const MAX_EVENTS_PER_ORDER = 1000;
+const security = createBackendSecurity();
 
 app.use(cors());
 app.use(express.json({ limit: "20mb" }));
+app.use("/api/plugin", security.authorizeProxy);
+app.use("/api/iiko", security.authorizeProxy);
 
 const io = new Server(httpServer, {
     path: "/plugin-websocket/socket.io",
@@ -26,6 +30,7 @@ const io = new Server(httpServer, {
 });
 
 const pluginIO = io.of("/plugin-websocket");
+pluginIO.use(security.authorizePlugin);
 const plugins = new Map();
 const pluginRegistry = new Map();
 const pendingRequests = new Map();
@@ -320,6 +325,7 @@ app.get("/health", (req, res) => res.json({ success: true, service: "anarsystem-
 
 app.post("/api/plugin/request", async (req, res) => {
     const body = req.body || {};
+    if (security.strict && !requestedDepartmentIds(body).length) return res.status(400).json({ success: false, error: "departmentIds is required" });
     const action = body.action;
     if (!action) return res.status(400).json({ success: false, error: "action is required" });
     const plugin = findPlugin(body);
@@ -336,6 +342,7 @@ app.post("/api/plugin/request", async (req, res) => {
 });
 
 app.get("/api/plugin/order-history", (req, res) => {
+    if (security.strict && !requestedDepartmentIds(req.query).length) return res.status(400).json({ success: false, error: "departmentIds is required" });
     const number = req.query.orderNum;
     if (number === undefined || number === null || number === "") return res.status(400).json({ success: false, error: "orderNum is required" });
     const plugin = findPlugin(req.query);
@@ -349,19 +356,20 @@ app.get("/api/plugin/order-history", (req, res) => {
 pluginIO.on("connection", socket => {
     const q = socket.handshake.query || {};
     const a = socket.handshake.auth || {};
+    const trusted = socket.data.shPluginIdentity || null;
     const plugin = {
         socket,
         socketId: socket.id,
         online: true,
-        pluginId: q.pluginId || a.pluginId || null,
+        pluginId: trusted?.pluginId || q.pluginId || a.pluginId || null,
         pluginName: q.pluginName || a.pluginName || null,
-        departmentId: q.departmentId || a.departmentId || null,
+        departmentId: trusted?.departmentId || q.departmentId || a.departmentId || null,
         departmentName: q.departmentName || a.departmentName || null,
         groupId: q.groupId || a.groupId || null,
         groupName: q.groupName || a.groupName || null,
         version: q.version || a.version || null,
         currencyCode: q.currencyCode || a.currencyCode || null,
-        serverUrl: a.serverUrl || q.serverUrl || null,
+        serverUrl: trusted?.serverUrl || a.serverUrl || q.serverUrl || null,
         connectedAt: now(),
         lastEventAt: null,
         lastResponseAt: null,
@@ -380,6 +388,7 @@ pluginIO.on("connection", socket => {
 
     socket.on("plugin_to_server", raw => {
         const message = normalizeMessage(raw);
+        if (security.strict && !security.isTrustedPluginMessage(trusted, message)) return;
         plugin.lastResponseAt = now();
 
         // Business events from the Plugin use plugin_to_server. Keep the
@@ -413,15 +422,15 @@ pluginIO.on("connection", socket => {
         }
 
         if (message && typeof message === "object") {
-            plugin.pluginId = message.pluginId || plugin.pluginId;
+            if (!security.strict) plugin.pluginId = message.pluginId || plugin.pluginId;
             plugin.pluginName = message.pluginName || plugin.pluginName;
-            plugin.departmentId = message.departmentId || plugin.departmentId;
+            if (!security.strict) plugin.departmentId = message.departmentId || plugin.departmentId;
             plugin.departmentName = message.departmentName || plugin.departmentName;
             plugin.groupId = message.groupId || plugin.groupId;
             plugin.groupName = message.groupName || plugin.groupName;
             plugin.version = message.version || plugin.version;
             plugin.currencyCode = message.currencyCode || plugin.currencyCode;
-            plugin.serverUrl = message.serverUrl || plugin.serverUrl;
+            if (!security.strict) plugin.serverUrl = message.serverUrl || plugin.serverUrl;
             if (plugin.pluginId) {
                 pluginRegistry.set(String(plugin.pluginId), { ...(pluginRegistry.get(String(plugin.pluginId)) || {}), pluginId: plugin.pluginId, pluginName: plugin.pluginName, departmentId: plugin.departmentId, departmentName: plugin.departmentName, groupId: plugin.groupId, groupName: plugin.groupName, version: plugin.version, currencyCode: plugin.currencyCode, lastEventAt: plugin.lastEventAt, connectedAt: plugin.connectedAt, disconnectedAt: null, online: true });
             }
@@ -436,6 +445,7 @@ pluginIO.on("connection", socket => {
     });
 
     socket.on("plugin_to_server_event", event => {
+        if (security.strict && !security.isTrustedPluginMessage(trusted, event)) return;
         plugin.lastEventAt = now();
         plugin.lastEvent = event;
         mergeOrderEvent(plugin, event);
@@ -456,6 +466,7 @@ pluginIO.on("connection", socket => {
 
 app.get("/api/plugin/data", (req, res) => {
     const hasBinding = requestedDepartmentIds(req.query || {}).length > 0;
+    if (security.strict && !hasBinding) return res.status(400).json({ success: false, error: "departmentIds is required" });
     const source = Array.from(pluginRegistry.values());
     const visible = hasBinding ? source.filter(plugin => pluginMatchesBinding(plugin, req.query || {})) : source;
     const activeById = new Map();
