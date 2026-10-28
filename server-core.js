@@ -9,7 +9,7 @@ const { createBackendSecurity } = require("./security");
 
 const app = express();
 const httpServer = http.createServer(app);
-const PORT = 3000;
+const PORT = Number(process.env.PORT) || 3000;
 const REQUEST_TIMEOUT_MS = 30000;
 const HISTORY_FILE = path.join(__dirname, "order-history.json");
 const MAX_EVENTS_PER_ORDER = 1000;
