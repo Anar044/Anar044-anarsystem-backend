@@ -4,3 +4,8 @@ server.log
 .env
 .env.*
 !.env.example
+
+# Old local server snapshots are kept in Git history, not in the deployed tree.
+server.js.backup*
+server.js.before-*
+server.js.save*
